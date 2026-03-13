@@ -74,7 +74,7 @@ export default function CodeViewer({ content, path, isLoading }: CodeViewerProps
   }
 
   return (
-    <div className="h-full flex flex-col bg-[#1E1E1E] rounded-xl overflow-hidden border border-zinc-800">
+    <div className="h-full flex flex-col bg-[#1E1E1E] overflow-hidden">
       <div className="flex items-center justify-between px-4 py-2 bg-zinc-900 border-b border-zinc-800 text-sm text-zinc-400 font-mono">
         <div className="flex items-center">
           <FileCode2 className="w-4 h-4 mr-2 text-emerald-500" />

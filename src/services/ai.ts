@@ -15,6 +15,175 @@ export interface AIAnalysisResult {
   responseText?: string | null;
 }
 
+export interface EntryFileAnalysis {
+  isEntryFile: boolean;
+  reason: string;
+}
+
+export async function analyzeEntryFile(
+  repoUrl: string,
+  summary: string,
+  languages: string[],
+  filePath: string,
+  fileContent: string
+): Promise<{ analysis: EntryFileAnalysis | null, requestPayload: any, responseText: string | null }> {
+  const requestPayload = {
+    model: 'gemini-3-flash-preview',
+    contents: `请作为一名资深的高级软件工程师，研判以下文件是否是该项目的真实入口文件。
+
+项目 GitHub 地址: ${repoUrl}
+项目简介: ${summary}
+主要编程语言: ${languages.join(', ')}
+
+当前研判文件路径: ${filePath}
+文件内容:
+\`\`\`
+${fileContent}
+\`\`\`
+
+请仔细分析该文件的内容，判断它是否是整个项目的主入口文件（例如：启动服务器、挂载前端应用、初始化核心模块等）。
+请严格按照以下 JSON 格式返回结果：
+{
+  "isEntryFile": true, // 或 false，表示是否是真实的入口文件
+  "reason": "请给出详细的研判理由，解释为什么它是或不是入口文件。"
+}`,
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          isEntryFile: {
+            type: Type.BOOLEAN,
+            description: "是否是项目的真实入口文件",
+          },
+          reason: {
+            type: Type.STRING,
+            description: "研判理由，解释为什么它是或不是入口文件",
+          }
+        },
+        required: ["isEntryFile", "reason"]
+      }
+    }
+  };
+
+  try {
+    const response = await ai.models.generateContent(requestPayload);
+
+    let analysis: EntryFileAnalysis | null = null;
+    if (response.text) {
+      try {
+        analysis = JSON.parse(response.text) as EntryFileAnalysis;
+      } catch (e) {
+        console.error("Failed to parse JSON for entry file analysis", e);
+      }
+    }
+    return { analysis, requestPayload, responseText: response.text || null };
+  } catch (error) {
+    console.error("AI 研判入口文件失败:", error);
+    return { analysis: null, requestPayload, responseText: String(error) };
+  }
+}
+
+export interface SubFunctionAnalysis {
+  name: string;
+  file: string;
+  description: string;
+  drillDown: -1 | 0 | 1; // -1: no, 0: unsure, 1: yes
+  children?: SubFunctionAnalysis[]; // For future recursive analysis
+}
+
+export interface EntryFunctionAnalysis {
+  entryFunctionName: string;
+  subFunctions: SubFunctionAnalysis[];
+}
+
+export async function analyzeSubFunctions(
+  repoUrl: string,
+  summary: string,
+  entryFilePath: string,
+  entryFileContent: string,
+  allFiles: string[]
+): Promise<{ analysis: EntryFunctionAnalysis | null, requestPayload: any, responseText: string | null }> {
+  const requestPayload = {
+    model: 'gemini-3-flash-preview',
+    contents: `请作为一名资深的高级软件工程师，分析以下项目的入口文件，并识别出入口函数调用的关键子函数。
+
+项目 GitHub 地址: ${repoUrl}
+项目简介: ${summary}
+项目文件列表:
+${allFiles.slice(0, 1000).join('\n')}
+
+入口文件路径: ${entryFilePath}
+入口文件内容:
+\`\`\`
+${entryFileContent}
+\`\`\`
+
+请根据项目的简介和核心功能逻辑，研判该入口文件中调用的关键子函数（数量不超过20个）。
+对于每一个子函数，请根据函数名、项目的文件列表和其他上下文研判：
+1. 它可能定义在哪个文件中。
+2. 给出函数的功能简介。
+3. 研判其是否值得进一步下钻分析（-1表示不需要进一步下钻分析，0表示不确定，1表示需要进一步下钻分析）。
+
+请严格按照以下 JSON 格式返回结果：
+{
+  "entryFunctionName": "入口函数名 (例如 main, App, init 等)",
+  "subFunctions": [
+    {
+      "name": "子函数名",
+      "file": "推测该子函数所在的文件路径",
+      "description": "函数功能简介",
+      "drillDown": 1 // -1, 0, 或 1
+    }
+  ]
+}`,
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          entryFunctionName: {
+            type: Type.STRING,
+            description: "入口函数名",
+          },
+          subFunctions: {
+            type: Type.ARRAY,
+            description: "调用的关键子函数列表，最多20个",
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                name: { type: Type.STRING, description: "子函数名" },
+                file: { type: Type.STRING, description: "推测该子函数所在的文件路径" },
+                description: { type: Type.STRING, description: "函数功能简介" },
+                drillDown: { type: Type.INTEGER, description: "是否值得进一步下钻分析 (-1, 0, 1)" }
+              },
+              required: ["name", "file", "description", "drillDown"]
+            }
+          }
+        },
+        required: ["entryFunctionName", "subFunctions"]
+      }
+    }
+  };
+
+  try {
+    const response = await ai.models.generateContent(requestPayload);
+
+    let analysis: EntryFunctionAnalysis | null = null;
+    if (response.text) {
+      try {
+        analysis = JSON.parse(response.text) as EntryFunctionAnalysis;
+      } catch (e) {
+        console.error("Failed to parse JSON for sub-functions analysis", e);
+      }
+    }
+    return { analysis, requestPayload, responseText: response.text || null };
+  } catch (error) {
+    console.error("AI 研判子函数失败:", error);
+    return { analysis: null, requestPayload, responseText: String(error) };
+  }
+}
+
 export async function analyzeProjectFiles(files: string[]): Promise<AIAnalysisResult> {
   const requestPayload = {
     model: 'gemini-3-flash-preview',

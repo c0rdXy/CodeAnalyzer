@@ -1,12 +1,13 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
-import { Github, Search, AlertCircle, Loader2, ArrowLeft, Settings, Sparkles, Code2, Layers, FileTerminal, Activity, ChevronDown, ChevronRight, Maximize2, X } from 'lucide-react';
+import { Github, Search, AlertCircle, Loader2, ArrowLeft, Settings, Sparkles, Code2, Layers, FileTerminal, Activity, ChevronDown, ChevronRight, Maximize2, X, CheckCircle } from 'lucide-react';
 import { motion } from 'motion/react';
 import { parseGithubUrl, fetchRepoInfo, fetchFileTree, fetchFileContent, GithubFileNode, GithubRepoInfo } from '../utils/github';
 import FileTree from '../components/FileTree';
 import CodeViewer from '../components/CodeViewer';
 import SettingsModal from '../components/SettingsModal';
-import { analyzeProjectFiles, ProjectAnalysis } from '../services/ai';
+import PanoramaPanel from '../components/PanoramaPanel';
+import { analyzeProjectFiles, analyzeEntryFile, analyzeSubFunctions, ProjectAnalysis, EntryFunctionAnalysis } from '../services/ai';
 
 interface LogEntry {
   id: string;
@@ -105,16 +106,22 @@ export default function Analyze() {
   const [urlInput, setUrlInput] = useState(urlParam);
   const [repoInfo, setRepoInfo] = useState<GithubRepoInfo | null>(null);
   const [files, setFiles] = useState<GithubFileNode[]>([]);
-  const [selectedFile, setSelectedFile] = useState<string | null>(null);
-  const [fileContent, setFileContent] = useState<string | null>(null);
-  
+  const [openedFiles, setOpenedFiles] = useState<string[]>([]);
+  const [activeFile, setActiveFile] = useState<string | null>(null);
+  const [fileContents, setFileContents] = useState<Record<string, string>>({});
+  const [loadingFiles, setLoadingFiles] = useState<Record<string, boolean>>({});
   const [isTreeLoading, setIsTreeLoading] = useState(false);
-  const [isContentLoading, setIsContentLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
   const [aiAnalysis, setAiAnalysis] = useState<ProjectAnalysis | null>(null);
   const [isAiLoading, setIsAiLoading] = useState(false);
+
+  const [confirmedEntryFile, setConfirmedEntryFile] = useState<{ path: string, reason: string } | null>(null);
+  const [isVerifyingEntry, setIsVerifyingEntry] = useState(false);
+
+  const [subFunctionAnalysis, setSubFunctionAnalysis] = useState<EntryFunctionAnalysis | null>(null);
+  const [isSubFunctionLoading, setIsSubFunctionLoading] = useState(false);
 
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [isLogsExpanded, setIsLogsExpanded] = useState(true);
@@ -143,9 +150,13 @@ export default function Analyze() {
     setError(null);
     setRepoInfo(null);
     setFiles([]);
-    setSelectedFile(null);
-    setFileContent(null);
+    setOpenedFiles([]);
+    setActiveFile(null);
+    setFileContents({});
+    setLoadingFiles({});
     setAiAnalysis(null);
+    setConfirmedEntryFile(null);
+    setSubFunctionAnalysis(null);
     setIsTreeLoading(true);
     setLogs([]);
 
@@ -167,7 +178,12 @@ export default function Analyze() {
       addLog(`获取文件树成功，共 ${tree.length} 个文件/目录`, 'success');
 
       // Trigger AI Analysis
-      analyzeTree(tree);
+      const analysisResult = await analyzeTree(tree);
+      
+      // Trigger Entry File Verification
+      if (analysisResult && analysisResult.entryFiles && analysisResult.entryFiles.length > 0) {
+        await verifyEntryFiles(analysisResult, info, repoUrl, tree);
+      }
 
     } catch (err: any) {
       setError(err.message || '加载仓库失败');
@@ -177,7 +193,74 @@ export default function Analyze() {
     }
   };
 
-  const analyzeTree = async (tree: GithubFileNode[]) => {
+  const verifyEntryFiles = async (analysis: ProjectAnalysis, repo: GithubRepoInfo, repoUrl: string, tree: GithubFileNode[]) => {
+    setIsVerifyingEntry(true);
+    setConfirmedEntryFile(null);
+    addLog(`开始逐个研判 ${analysis.entryFiles.length} 个可能的入口文件...`, 'info');
+
+    for (const path of analysis.entryFiles) {
+      addLog(`正在获取可能入口文件的内容: ${path}`, 'info');
+      try {
+        const content = await fetchFileContent(repo.owner, repo.repo, repo.defaultBranch, path);
+        
+        const lines = content.split('\n');
+        let contentToSend = content;
+        if (lines.length > 4000) {
+          const first2000 = lines.slice(0, 2000).join('\n');
+          const last2000 = lines.slice(-2000).join('\n');
+          contentToSend = `${first2000}\n\n... [中间省略 ${lines.length - 4000} 行] ...\n\n${last2000}`;
+          addLog(`文件 ${path} 超过 4000 行 (共 ${lines.length} 行)，已截取前后 2000 行`, 'info');
+        }
+
+        addLog(`正在呼叫 AI 研判文件: ${path}`, 'info');
+        const { analysis: entryAnalysis, requestPayload, responseText } = await analyzeEntryFile(
+          repoUrl,
+          analysis.summary,
+          analysis.mainLanguages,
+          path,
+          contentToSend
+        );
+
+        if (entryAnalysis) {
+          addLog(`AI 研判完成: ${path} -> ${entryAnalysis.isEntryFile ? '是' : '否'}入口文件`, entryAnalysis.isEntryFile ? 'success' : 'info', { request: requestPayload, response: responseText });
+          
+          if (entryAnalysis.isEntryFile) {
+            setConfirmedEntryFile({ path, reason: entryAnalysis.reason });
+            addLog(`已确认项目入口文件: ${path}，停止后续研判。`, 'success');
+            
+            // Start sub-function analysis
+            setIsSubFunctionLoading(true);
+            addLog(`开始分析入口文件 ${path} 的关键子函数...`, 'info');
+            const allPaths = tree.filter(n => n.type === 'blob').map(n => n.path);
+            const { analysis: subAnalysis, requestPayload: subReq, responseText: subRes } = await analyzeSubFunctions(
+              repoUrl,
+              analysis.summary,
+              path,
+              contentToSend,
+              allPaths
+            );
+            
+            if (subAnalysis) {
+              setSubFunctionAnalysis(subAnalysis);
+              addLog(`AI 子函数分析完成，共识别出 ${subAnalysis.subFunctions.length} 个关键子函数`, 'success', { request: subReq, response: subRes });
+            } else {
+              addLog(`AI 子函数分析失败`, 'error', { request: subReq, response: subRes });
+            }
+            setIsSubFunctionLoading(false);
+            
+            break;
+          }
+        } else {
+          addLog(`AI 研判失败: ${path}`, 'error', { request: requestPayload, response: responseText });
+        }
+      } catch (err: any) {
+        addLog(`获取或研判文件 ${path} 失败: ${err.message}`, 'error');
+      }
+    }
+    setIsVerifyingEntry(false);
+  };
+
+  const analyzeTree = async (tree: GithubFileNode[]): Promise<ProjectAnalysis | null> => {
     setIsAiLoading(true);
     addLog('开始准备 AI 分析...', 'info');
     try {
@@ -214,12 +297,15 @@ export default function Analyze() {
       if (analysis) {
         addLog('AI 分析成功', 'success', { request: requestPayload, response: responseText });
         setAiAnalysis(analysis);
+        return analysis;
       } else {
         addLog('AI 分析未返回有效结果', 'error', { request: requestPayload, response: responseText });
+        return null;
       }
     } catch (err: any) {
       console.error("AI Analysis failed:", err);
       addLog(`AI 分析过程发生异常: ${err.message}`, 'error');
+      return null;
     } finally {
       setIsAiLoading(false);
     }
@@ -233,21 +319,40 @@ export default function Analyze() {
   };
 
   const handleSelectFile = async (path: string) => {
-    if (selectedFile === path) return;
+    if (activeFile === path) return;
     
-    setSelectedFile(path);
-    setIsContentLoading(true);
-    setFileContent(null);
+    setActiveFile(path);
+    
+    if (!openedFiles.includes(path)) {
+      setOpenedFiles(prev => [...prev, path]);
+    }
+
+    if (fileContents[path] !== undefined) {
+      return; // Already loaded or loading
+    }
+
+    setLoadingFiles(prev => ({ ...prev, [path]: true }));
 
     try {
       if (!repoInfo) throw new Error('缺少仓库信息');
       const content = await fetchFileContent(repoInfo.owner, repoInfo.repo, repoInfo.defaultBranch, path);
-      setFileContent(content);
+      setFileContents(prev => ({ ...prev, [path]: content }));
     } catch (err: any) {
-      setFileContent(`加载文件出错: ${err.message}`);
+      setFileContents(prev => ({ ...prev, [path]: `加载文件出错: ${err.message}` }));
     } finally {
-      setIsContentLoading(false);
+      setLoadingFiles(prev => ({ ...prev, [path]: false }));
     }
+  };
+
+  const handleCloseFile = (e: React.MouseEvent, path: string) => {
+    e.stopPropagation();
+    setOpenedFiles(prev => {
+      const newOpened = prev.filter(p => p !== path);
+      if (activeFile === path) {
+        setActiveFile(newOpened.length > 0 ? newOpened[newOpened.length - 1] : null);
+      }
+      return newOpened;
+    });
   };
 
   const handleSettingsClose = () => {
@@ -418,18 +523,42 @@ export default function Analyze() {
                       <FileTerminal className="w-4 h-4" />
                       <span className="font-medium">主入口文件</span>
                     </div>
-                    <div className="flex flex-col gap-1.5">
-                      {aiAnalysis.entryFiles.map((file, i) => (
+                    
+                    {confirmedEntryFile ? (
+                      <div className="mt-2 p-3 bg-emerald-500/10 border border-emerald-500/20 rounded-xl">
+                        <div className="flex items-center gap-2 text-emerald-400 font-medium mb-1.5">
+                          <CheckCircle className="w-4 h-4" />
+                          <span className="truncate" title={confirmedEntryFile.path}>{confirmedEntryFile.path}</span>
+                        </div>
+                        <p className="text-zinc-400 text-xs leading-relaxed mb-3">{confirmedEntryFile.reason}</p>
                         <button 
-                          key={i}
-                          onClick={() => handleSelectFile(file)}
-                          className="text-left px-2 py-1.5 bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 rounded-md text-xs text-zinc-300 hover:text-emerald-400 transition-colors truncate"
-                          title={file}
+                          onClick={() => handleSelectFile(confirmedEntryFile.path)}
+                          className="text-xs bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 py-1.5 px-3 rounded-lg transition-colors"
                         >
-                          {file}
+                          查看文件
                         </button>
-                      ))}
-                    </div>
+                      </div>
+                    ) : (
+                      <div className="flex flex-col gap-1.5">
+                        {aiAnalysis.entryFiles.map((file, i) => (
+                          <button 
+                            key={i}
+                            onClick={() => handleSelectFile(file)}
+                            className="text-left px-3 py-2 bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 rounded-lg text-xs text-zinc-300 hover:text-emerald-400 transition-colors truncate"
+                            title={file}
+                          >
+                            {file}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    
+                    {isVerifyingEntry && !confirmedEntryFile && (
+                      <div className="mt-3 flex items-center gap-2 text-zinc-400 text-xs bg-zinc-900/50 p-2 rounded-lg border border-zinc-800/50">
+                        <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-500" />
+                        <span>正在研判真实入口文件...</span>
+                      </div>
+                    )}
                   </div>
                 </div>
               ) : null}
@@ -444,7 +573,7 @@ export default function Analyze() {
         </div>
 
         {/* Middle Column: File Tree */}
-        <div className={`w-full lg:w-72 border-r border-zinc-800 bg-zinc-900/10 flex-col shrink-0 ${(files.length === 0 && !isTreeLoading) ? 'hidden lg:flex' : ''} ${selectedFile ? 'hidden lg:flex' : 'flex'}`}>
+        <div className={`w-full lg:w-72 border-r border-zinc-800 bg-zinc-900/10 flex-col shrink-0 ${(files.length === 0 && !isTreeLoading) ? 'hidden lg:flex' : ''} ${activeFile ? 'hidden lg:flex' : 'flex'}`}>
           <div className="h-10 border-b border-zinc-800 flex items-center px-4 text-xs font-semibold text-zinc-400 uppercase tracking-wider shrink-0 bg-zinc-900/30 justify-between">
             <span>文件列表</span>
             <button 
@@ -464,7 +593,7 @@ export default function Analyze() {
               <FileTree 
                 files={files} 
                 onSelectFile={handleSelectFile} 
-                selectedFile={selectedFile}
+                selectedFile={activeFile}
               />
             ) : !error ? (
               <div className="absolute inset-0 flex items-center justify-center text-zinc-600 text-sm text-center px-4">
@@ -474,22 +603,67 @@ export default function Analyze() {
           </div>
         </div>
 
-        {/* Right Column: Code Viewer */}
-        <div className={`flex-1 bg-zinc-950 p-4 overflow-hidden flex-col min-w-0 ${selectedFile ? 'flex' : 'hidden lg:flex'}`}>
-          {selectedFile && (
-            <button 
-              onClick={() => setSelectedFile(null)}
-              className="lg:hidden mb-4 flex items-center gap-2 text-sm text-zinc-400 hover:text-zinc-100 transition-colors w-fit"
-            >
-              <ArrowLeft className="w-4 h-4" />
-              返回文件列表
-            </button>
-          )}
-          <CodeViewer 
-            content={fileContent} 
-            path={selectedFile} 
-            isLoading={isContentLoading} 
-          />
+        {/* Right Area: Code Viewer & Panorama */}
+        <div className={`flex-1 flex flex-col lg:flex-row overflow-hidden min-w-0 ${activeFile || confirmedEntryFile ? 'flex' : 'hidden lg:flex'}`}>
+          {/* Code Viewer */}
+          <div className={`flex-1 bg-zinc-950 overflow-hidden flex-col min-w-0 ${activeFile ? 'flex' : 'hidden lg:flex'} lg:border-r border-zinc-800`}>
+            {/* Tabs */}
+            {openedFiles.length > 0 && (
+              <div className="flex bg-zinc-900 border-b border-zinc-800 overflow-x-auto custom-scrollbar shrink-0">
+                {openedFiles.map(path => (
+                  <div 
+                    key={path}
+                    onClick={() => setActiveFile(path)}
+                    className={`flex items-center gap-2 px-4 py-2 text-sm border-r border-zinc-800 cursor-pointer whitespace-nowrap group ${
+                      activeFile === path ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-300'
+                    }`}
+                  >
+                    <span className="truncate max-w-[150px]" title={path}>
+                      {path.split('/').pop()}
+                    </span>
+                    <button 
+                      onClick={(e) => handleCloseFile(e, path)}
+                      className="p-0.5 rounded-md hover:bg-zinc-700 text-zinc-500 hover:text-zinc-300 opacity-0 group-hover:opacity-100 transition-opacity"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div className="flex-1 overflow-hidden relative">
+              {activeFile && (
+                <button 
+                  onClick={() => setActiveFile(null)}
+                  className="lg:hidden m-4 flex items-center gap-2 text-sm text-zinc-400 hover:text-zinc-100 transition-colors w-fit absolute top-0 left-0 z-10"
+                >
+                  <ArrowLeft className="w-4 h-4" />
+                  返回文件列表
+                </button>
+              )}
+              <CodeViewer 
+                content={activeFile ? fileContents[activeFile] : null} 
+                path={activeFile} 
+                isLoading={activeFile ? loadingFiles[activeFile] : false} 
+              />
+            </div>
+          </div>
+
+          {/* Panorama Panel */}
+          <div className="flex-1 overflow-hidden flex flex-col min-w-0 bg-zinc-950 relative">
+             <div className="h-10 border-b border-zinc-800 flex items-center px-4 text-xs font-semibold text-zinc-400 uppercase tracking-wider shrink-0 bg-zinc-900/30 z-10">
+               <span>全景图</span>
+             </div>
+             {isSubFunctionLoading ? (
+                <div className="flex-1 flex flex-col items-center justify-center text-zinc-500 gap-3">
+                  <Loader2 className="w-6 h-6 animate-spin text-emerald-500" />
+                  <span className="text-sm">正在分析关键子函数...</span>
+                </div>
+             ) : (
+                <PanoramaPanel analysis={subFunctionAnalysis} entryFilePath={confirmedEntryFile?.path || ''} />
+             )}
+          </div>
         </div>
       </div>
 
