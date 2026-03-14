@@ -1,6 +1,62 @@
 @import "tailwindcss";
 @plugin "@tailwindcss/typography";
 
+@keyframes dash-flow-horizontal {
+  from {
+    background-position: 0 0;
+  }
+
+  to {
+    background-position: 24px 0;
+  }
+}
+
+@keyframes dash-flow-vertical {
+  from {
+    background-position: 0 0;
+  }
+
+  to {
+    background-position: 0 24px;
+  }
+}
+
+@keyframes panorama-node-enter {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.98);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes panorama-link-horizontal {
+  from {
+    opacity: 0;
+    transform: translateY(-50%) scaleX(0);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(-50%) scaleX(1);
+  }
+}
+
+@keyframes panorama-link-vertical {
+  from {
+    opacity: 0;
+    transform: scaleY(0);
+  }
+
+  to {
+    opacity: 1;
+    transform: scaleY(1);
+  }
+}
+
 @layer utilities {
   .custom-scrollbar::-webkit-scrollbar {
     width: 8px;
@@ -15,5 +71,47 @@
   }
   .custom-scrollbar::-webkit-scrollbar-thumb:hover {
     background: #52525b;
+  }
+
+  .animated-dash-horizontal {
+    height: 2px;
+    background-image: repeating-linear-gradient(
+      to right,
+      rgba(113, 113, 122, 0.9) 0,
+      rgba(113, 113, 122, 0.9) 8px,
+      transparent 8px,
+      transparent 16px
+    );
+    animation: dash-flow-horizontal 1.2s linear infinite;
+  }
+
+  .animated-dash-vertical {
+    width: 2px;
+    background-image: repeating-linear-gradient(
+      to bottom,
+      rgba(113, 113, 122, 0.9) 0,
+      rgba(113, 113, 122, 0.9) 8px,
+      transparent 8px,
+      transparent 16px
+    );
+    animation: dash-flow-vertical 1.2s linear infinite;
+  }
+
+  .panorama-node-enter {
+    animation: panorama-node-enter 0.35s ease-out;
+  }
+
+  .panorama-link-horizontal {
+    transform-origin: left center;
+    animation:
+      panorama-link-horizontal 0.4s ease-out,
+      dash-flow-horizontal 1.2s linear infinite 0.4s;
+  }
+
+  .panorama-link-vertical {
+    transform-origin: top center;
+    animation:
+      panorama-link-vertical 0.4s ease-out,
+      dash-flow-vertical 1.2s linear infinite 0.4s;
   }
 }
