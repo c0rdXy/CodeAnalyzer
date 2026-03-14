@@ -1,7 +1,8 @@
 {
-  "name": "react-example",
+  "name": "code-analyzer",
   "private": true,
   "version": "1.0.2",
+  "description": "AI-powered GitHub repository code analyzer with entry detection, recursive function drill-down, and panorama visualization.",
   "type": "module",
   "scripts": {
     "dev": "vite --port=3000 --host=0.0.0.0",
