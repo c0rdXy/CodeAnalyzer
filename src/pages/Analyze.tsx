@@ -13,16 +13,19 @@ import {
   analyzeSubFunctions,
   analyzeFunctionImplementation,
   guessFunctionFiles,
+  FunctionFileGuess,
   ProjectAnalysis,
   EntryFunctionAnalysis,
   SubFunctionAnalysis,
 } from '../services/analysisAi';
 import {
+  extractFunctionNamesFromContent,
   findFunctionDefinitionInContent,
   prioritizeSearchPaths,
   searchFunctionInFiles,
   trimFunctionSnippet,
 } from '../utils/functionSearch';
+import { detectEntryFunctionCandidate } from '../utils/entryAnalysis';
 
 interface LogEntry {
   id: string;
@@ -91,11 +94,74 @@ const ENTRY_FILE_PRIORITY_PATTERNS: Array<{ pattern: RegExp; score: number }> = 
 ];
 
 const DEFAULT_MAX_RECURSION_DEPTH = 2;
+const DEFAULT_MAX_ENTRY_FILE_CANDIDATES = 3;
+const DEFAULT_MAX_DRILLDOWN_PER_LEVEL = 3;
+const DEFAULT_MAX_HEURISTIC_SEARCH_FILES = 24;
+const DEFAULT_MAX_PROJECT_SEARCH_FILES = 80;
+const DEFAULT_MAX_ANALYSIS_NODES = 12;
+const DEFAULT_MAX_INDEX_FILES = 48;
+const DEFAULT_INDEX_CONCURRENCY = 4;
 
 const MAX_RECURSION_DEPTH = (() => {
   const parsed = Number(process.env.AI_MAX_RECURSION_DEPTH || DEFAULT_MAX_RECURSION_DEPTH);
   if (!Number.isFinite(parsed) || parsed < 0) {
     return DEFAULT_MAX_RECURSION_DEPTH;
+  }
+  return Math.floor(parsed);
+})();
+
+const MAX_ENTRY_FILE_CANDIDATES = (() => {
+  const parsed = Number(process.env.AI_MAX_ENTRY_FILE_CANDIDATES || DEFAULT_MAX_ENTRY_FILE_CANDIDATES);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return DEFAULT_MAX_ENTRY_FILE_CANDIDATES;
+  }
+  return Math.floor(parsed);
+})();
+
+const MAX_DRILLDOWN_PER_LEVEL = (() => {
+  const parsed = Number(process.env.AI_MAX_DRILLDOWN_PER_LEVEL || DEFAULT_MAX_DRILLDOWN_PER_LEVEL);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return DEFAULT_MAX_DRILLDOWN_PER_LEVEL;
+  }
+  return Math.floor(parsed);
+})();
+
+const MAX_HEURISTIC_SEARCH_FILES = (() => {
+  const parsed = Number(process.env.AI_MAX_HEURISTIC_SEARCH_FILES || DEFAULT_MAX_HEURISTIC_SEARCH_FILES);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return DEFAULT_MAX_HEURISTIC_SEARCH_FILES;
+  }
+  return Math.floor(parsed);
+})();
+
+const MAX_PROJECT_SEARCH_FILES = (() => {
+  const parsed = Number(process.env.AI_MAX_PROJECT_SEARCH_FILES || DEFAULT_MAX_PROJECT_SEARCH_FILES);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return DEFAULT_MAX_PROJECT_SEARCH_FILES;
+  }
+  return Math.floor(parsed);
+})();
+
+const MAX_ANALYSIS_NODES = (() => {
+  const parsed = Number(process.env.AI_MAX_ANALYSIS_NODES || DEFAULT_MAX_ANALYSIS_NODES);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return DEFAULT_MAX_ANALYSIS_NODES;
+  }
+  return Math.floor(parsed);
+})();
+
+const MAX_INDEX_FILES = (() => {
+  const parsed = Number(process.env.AI_MAX_INDEX_FILES || DEFAULT_MAX_INDEX_FILES);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return DEFAULT_MAX_INDEX_FILES;
+  }
+  return Math.floor(parsed);
+})();
+
+const INDEX_CONCURRENCY = (() => {
+  const parsed = Number(process.env.AI_INDEX_CONCURRENCY || DEFAULT_INDEX_CONCURRENCY);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return DEFAULT_INDEX_CONCURRENCY;
   }
   return Math.floor(parsed);
 })();
@@ -139,6 +205,33 @@ const getEntryCandidateScore = (path: string) => {
 };
 
 const buildPanoramaNodeId = (path: number[]) => (path.length === 0 ? 'root' : `node-${path.join('-')}`);
+
+const rankSymbolIndexPaths = (paths: string[]) => {
+  const scorePath = (path: string) => {
+    let score = 0;
+    const lower = path.toLowerCase();
+
+    if (/\/(src|app|lib|server|client|cmd|internal|pkg|core|domain|modules|features|services|controllers)\//.test(lower)) {
+      score += 40;
+    }
+
+    if (/\.(tsx|ts|jsx|js|py|go|rs|java|kt|dart|swift|cs|php|rb|c|cpp|h|hpp|vue|svelte)$/.test(lower)) {
+      score += 20;
+    }
+
+    if (/(test|spec|mock|fixture|story|stories|min)\./.test(lower)) {
+      score -= 30;
+    }
+
+    if (/(generated|vendor|dist|build|coverage)\//.test(lower)) {
+      score -= 100;
+    }
+
+    return score;
+  };
+
+  return [...paths].sort((left, right) => scorePath(right) - scorePath(left));
+};
 
 const rankEntryFileCandidates = (allPaths: string[], aiEntryFiles: string[]) => {
   const scoreMap = new Map<string, number>();
@@ -303,7 +396,12 @@ export default function Analyze() {
   const desktopLayoutRef = useRef<HTMLDivElement | null>(null);
   const rightAreaRef = useRef<HTMLDivElement | null>(null);
   const fileContentCacheRef = useRef<Record<string, string>>({});
+  const pendingFileContentRequestsRef = useRef<Record<string, Promise<string>>>({});
+  const functionFileGuessCacheRef = useRef<Record<string, FunctionFileGuess | null>>({});
+  const fileSymbolCacheRef = useRef<Record<string, string[]>>({});
+  const symbolFileMapRef = useRef<Record<string, string[]>>({});
   const analyzablePathsRef = useRef<string[]>([]);
+  const analysisNodeCountRef = useRef(0);
   const dragStateRef = useRef<{
     type: 'overview' | 'files' | 'source';
     startX: number;
@@ -400,6 +498,339 @@ export default function Analyze() {
       window.addEventListener('mouseup', stopResize);
     };
 
+  const locateFunctionDefinition = async (input: {
+    repo: GithubRepoInfo;
+    repoUrl: string;
+    summary: string;
+    functionName: string;
+    parentFunctionName?: string;
+    parentFilePath?: string;
+    parentFileContent?: string;
+    hintedFilePath?: string;
+    allFiles: string[];
+  }): Promise<{
+    filePath: string;
+    snippet: string;
+    startLine: number;
+    endLine: number;
+    stage: 'same_file' | 'indexed_search' | 'heuristic_search' | 'ai_guess' | 'project_search';
+  } | null> => {
+    const startedAt = Date.now();
+
+    if (isLikelyExternalFunctionName(input.functionName)) {
+      addLog(`停止下钻 ${input.functionName}：疑似系统函数或库函数`, 'info');
+      return null;
+    }
+
+    if (input.parentFilePath && input.parentFileContent) {
+      addLog(`优先在上级同文件搜索函数定义：${input.functionName} -> ${input.parentFilePath}`, 'info');
+      const sameFileMatch = findFunctionDefinitionInContent(input.functionName, input.parentFileContent);
+      if (sameFileMatch) {
+        addStageLog(`已在同文件中定位到函数 ${input.functionName}`, startedAt);
+        return {
+          filePath: input.parentFilePath,
+          snippet: trimFunctionSnippet(sameFileMatch.snippet),
+          startLine: sameFileMatch.startLine,
+          endLine: sameFileMatch.endLine,
+          stage: 'same_file',
+        };
+      }
+    }
+
+    const indexedFiles = (symbolFileMapRef.current[input.functionName.toLowerCase()] || [])
+      .filter((filePath) => input.allFiles.includes(filePath))
+      .slice(0, MAX_HEURISTIC_SEARCH_FILES);
+
+    if (indexedFiles.length > 0) {
+      addLog(`命中本地函数索引，优先定位 ${input.functionName}`, 'info', { fileList: indexedFiles });
+      const indexedLocated = await searchFunctionInFiles({
+        functionName: input.functionName,
+        filePaths: indexedFiles,
+        getFileContent: (path) => getRepositoryFileContent(input.repo, path),
+        concurrency: INDEX_CONCURRENCY,
+      });
+
+      if (indexedLocated) {
+        addStageLog(`已通过本地函数索引定位到函数 ${input.functionName}: ${indexedLocated.filePath}`, startedAt);
+        return {
+          filePath: indexedLocated.filePath,
+          snippet: trimFunctionSnippet(indexedLocated.match.snippet),
+          startLine: indexedLocated.match.startLine,
+          endLine: indexedLocated.match.endLine,
+          stage: 'indexed_search',
+        };
+      }
+    }
+
+    const heuristicSearchPaths = prioritizeSearchPaths({
+      functionName: input.functionName,
+      allFiles: input.allFiles,
+      parentFilePath: input.parentFilePath,
+      hintedFiles: input.hintedFilePath ? [input.hintedFilePath] : undefined,
+    }).slice(0, MAX_HEURISTIC_SEARCH_FILES);
+
+    if (heuristicSearchPaths.length > 0) {
+      addLog(`启发式优先搜索函数 ${input.functionName}`, 'info', { fileList: heuristicSearchPaths });
+      const heuristicLocated = await searchFunctionInFiles({
+        functionName: input.functionName,
+        filePaths: heuristicSearchPaths,
+        getFileContent: (path) => getRepositoryFileContent(input.repo, path),
+        concurrency: INDEX_CONCURRENCY,
+      });
+
+      if (heuristicLocated) {
+        addStageLog(`已通过启发式搜索定位到函数 ${input.functionName}: ${heuristicLocated.filePath}`, startedAt);
+        return {
+          filePath: heuristicLocated.filePath,
+          snippet: trimFunctionSnippet(heuristicLocated.match.snippet),
+          startLine: heuristicLocated.match.startLine,
+          endLine: heuristicLocated.match.endLine,
+          stage: 'heuristic_search',
+        };
+      }
+    }
+
+    const guessCacheKey = [
+      input.functionName,
+      input.parentFunctionName || '',
+      input.parentFilePath || '',
+      input.hintedFilePath || '',
+    ].join('::');
+
+    let guessedFiles = functionFileGuessCacheRef.current[guessCacheKey];
+
+    if (guessedFiles === undefined) {
+      addLog(`请求 AI 推断函数可能所在文件：${input.functionName}`, 'info');
+      const guessedResult = await guessFunctionFiles({
+        repoUrl: input.repoUrl,
+        summary: input.summary,
+        functionName: input.functionName,
+        allFiles: input.allFiles,
+        parentFunctionName: input.parentFunctionName,
+        parentFilePath: input.parentFilePath,
+        hintedFilePath: input.hintedFilePath,
+      });
+      guessedFiles = guessedResult.analysis;
+      functionFileGuessCacheRef.current[guessCacheKey] = guessedFiles || null;
+      addLog(`AI 文件推断完成：${input.functionName}`, guessedFiles ? 'success' : 'error', {
+        request: guessedResult.requestPayload,
+        response: guessedResult.responseText,
+      });
+    }
+
+    if (guessedFiles && !guessedFiles.isProjectFunction) {
+      addLog(`停止下钻 ${input.functionName}：${guessedFiles.reason}`, 'info');
+      return null;
+    }
+
+    const aiCandidateFiles = Array.from(
+      new Set(
+        [input.hintedFilePath, ...(guessedFiles?.candidateFiles || [])].filter(
+          (filePath): filePath is string => Boolean(filePath && input.allFiles.includes(filePath))
+        )
+      )
+    );
+
+    if (aiCandidateFiles.length > 0) {
+      addLog(`按 AI 候选文件搜索函数 ${input.functionName}`, 'info', { fileList: aiCandidateFiles });
+      const aiLocated = await searchFunctionInFiles({
+        functionName: input.functionName,
+        filePaths: aiCandidateFiles,
+        getFileContent: (path) => getRepositoryFileContent(input.repo, path),
+        concurrency: INDEX_CONCURRENCY,
+      });
+
+      if (aiLocated) {
+        addStageLog(`已在 AI 候选文件中定位到函数 ${input.functionName}: ${aiLocated.filePath}`, startedAt);
+        return {
+          filePath: aiLocated.filePath,
+          snippet: trimFunctionSnippet(aiLocated.match.snippet),
+          startLine: aiLocated.match.startLine,
+          endLine: aiLocated.match.endLine,
+          stage: 'ai_guess',
+        };
+      }
+    }
+
+    const orderedSearchPaths = prioritizeSearchPaths({
+      functionName: input.functionName,
+      allFiles: input.allFiles,
+      parentFilePath: input.parentFilePath,
+      hintedFiles: aiCandidateFiles,
+    }).slice(0, MAX_PROJECT_SEARCH_FILES);
+
+    addLog(`启用项目级正则搜索定位函数：${input.functionName}`, 'info');
+    const searched = await searchFunctionInFiles({
+      functionName: input.functionName,
+      filePaths: orderedSearchPaths,
+      getFileContent: (path) => getRepositoryFileContent(input.repo, path),
+      concurrency: INDEX_CONCURRENCY,
+    });
+
+    if (!searched) {
+      addStageLog(`未能定位函数定义，停止下钻：${input.functionName}`, startedAt, 'info');
+      return null;
+    }
+
+    addStageLog(`已通过项目搜索定位到函数 ${input.functionName}: ${searched.filePath}`, startedAt);
+    return {
+      filePath: searched.filePath,
+      snippet: trimFunctionSnippet(searched.match.snippet),
+      startLine: searched.match.startLine,
+      endLine: searched.match.endLine,
+      stage: 'project_search',
+    };
+  };
+
+  const drillDownSubFunctions = async (input: {
+    repo: GithubRepoInfo;
+    repoUrl: string;
+    summary: string;
+    parentFunctionName: string;
+    parentFilePath: string;
+    parentFileContent: string;
+    subFunctions: SubFunctionAnalysis[];
+    allFiles: string[];
+    depth: number;
+    pathPrefix: number[];
+  }): Promise<void> => {
+    const prioritizedIndexes = input.subFunctions
+      .map((subFunction, index) => ({ subFunction, index }))
+      .sort((left, right) => right.subFunction.drillDown - left.subFunction.drillDown);
+
+    const allowedIndexes = new Set(
+      prioritizedIndexes
+        .filter(({ subFunction }) => subFunction.drillDown !== -1)
+        .slice(0, MAX_DRILLDOWN_PER_LEVEL)
+        .map(({ index }) => index)
+    );
+
+    for (const [index, subFunction] of input.subFunctions.entries()) {
+      const currentPath = [...input.pathPrefix, index];
+      setActivePanoramaNodeId(buildPanoramaNodeId(currentPath));
+
+      if (input.depth >= MAX_RECURSION_DEPTH) {
+        updateSubFunctionAtPath(currentPath, (node) => ({
+          ...node,
+          stopReason: node.stopReason || '已达到最大递归深度，停止继续下钻。',
+        }));
+        continue;
+      }
+
+      if (subFunction.drillDown === -1) {
+        updateSubFunctionAtPath(currentPath, (node) => ({
+          ...node,
+          stopReason: node.stopReason || '该函数被判定为非关键函数，不继续下钻。',
+        }));
+        continue;
+      }
+
+      if (!allowedIndexes.has(index)) {
+        updateSubFunctionAtPath(currentPath, (node) => ({
+          ...node,
+          stopReason: node.stopReason || `已超过单层下钻上限（${MAX_DRILLDOWN_PER_LEVEL} 个），本次跳过以提升分析速度。`,
+        }));
+        continue;
+      }
+
+      if (analysisNodeCountRef.current >= MAX_ANALYSIS_NODES) {
+        updateSubFunctionAtPath(currentPath, (node) => ({
+          ...node,
+          stopReason: node.stopReason || `已达到最大分析节点数上限（${MAX_ANALYSIS_NODES} 个），停止继续下钻。`,
+        }));
+        continue;
+      }
+
+      analysisNodeCountRef.current += 1;
+      const locateStartedAt = Date.now();
+      const located = await locateFunctionDefinition({
+        repo: input.repo,
+        repoUrl: input.repoUrl,
+        summary: input.summary,
+        functionName: subFunction.name,
+        parentFunctionName: input.parentFunctionName,
+        parentFilePath: input.parentFilePath,
+        parentFileContent: input.parentFileContent,
+        hintedFilePath: subFunction.file,
+        allFiles: input.allFiles,
+      });
+
+      if (!located) {
+        updateSubFunctionAtPath(currentPath, (node) => ({
+          ...node,
+          stopReason: node.stopReason || '未找到函数定义，停止下钻。',
+        }));
+        continue;
+      }
+
+      addStageLog(`函数定位完成：${subFunction.name}（${located.stage}）`, locateStartedAt);
+      const fileContent = await getRepositoryFileContent(input.repo, located.filePath);
+      updateSubFunctionAtPath(currentPath, (node) => ({
+        ...node,
+        resolvedFile: located.filePath,
+        resolvedSnippet: located.snippet,
+      }));
+
+      const functionAnalysisStartedAt = Date.now();
+      addLog(`调用 AI 深入分析函数 ${subFunction.name}（深度 ${input.depth + 1}）`, 'info');
+      const {
+        analysis: childAnalysis,
+        requestPayload,
+        responseText,
+      } = await analyzeFunctionImplementation({
+        repoUrl: input.repoUrl,
+        summary: input.summary,
+        functionName: subFunction.name,
+        filePath: located.filePath,
+        functionCode: located.snippet,
+        allFiles: input.allFiles,
+        parentFunctionName: input.parentFunctionName,
+        depth: input.depth + 1,
+      });
+
+      addStageLog(
+        childAnalysis ? `函数 ${subFunction.name} 深入分析完成` : `函数 ${subFunction.name} 深入分析失败`,
+        functionAnalysisStartedAt,
+        childAnalysis ? 'success' : 'error',
+        { request: requestPayload, response: responseText }
+      );
+
+      if (!childAnalysis || childAnalysis.shouldStop) {
+        updateSubFunctionAtPath(currentPath, (node) => ({
+          ...node,
+          description: childAnalysis?.summary || node.description,
+          stopReason:
+            childAnalysis?.stopReason ||
+            node.stopReason ||
+            'AI 判断该函数不适合继续下钻。',
+        }));
+        continue;
+      }
+
+      updateSubFunctionAtPath(currentPath, (node) => ({
+        ...node,
+        description: childAnalysis.summary || node.description,
+        resolvedFile: located.filePath,
+        resolvedSnippet: located.snippet,
+        children: childAnalysis.subFunctions,
+        stopReason: childAnalysis.stopReason,
+      }));
+
+      await drillDownSubFunctions({
+        repo: input.repo,
+        repoUrl: input.repoUrl,
+        summary: input.summary,
+        parentFunctionName: childAnalysis.entryFunctionName || subFunction.name,
+        parentFilePath: located.filePath,
+        parentFileContent: fileContent,
+        subFunctions: childAnalysis.subFunctions,
+        allFiles: input.allFiles,
+        depth: input.depth + 1,
+        pathPrefix: currentPath,
+      });
+    }
+  };
+
   useEffect(() => {
     return () => {
       stopResize();
@@ -421,6 +852,22 @@ export default function Analyze() {
       type,
       ...extra
     }]);
+  };
+
+  const formatDuration = (durationMs: number) => {
+    if (durationMs < 1000) {
+      return `${durationMs}ms`;
+    }
+    return `${(durationMs / 1000).toFixed(durationMs >= 10000 ? 0 : 1)}s`;
+  };
+
+  const addStageLog = (
+    message: string,
+    startedAt: number,
+    type: 'info' | 'success' | 'error' = 'success',
+    extra?: { request?: any, response?: any, fileList?: string[] }
+  ) => {
+    addLog(`${message}（耗时 ${formatDuration(Date.now() - startedAt)}）`, type, extra);
   };
 
   const updateSubFunctionAtPath = (
@@ -492,13 +939,63 @@ export default function Analyze() {
       return fileContentCacheRef.current[path];
     }
 
-    const content = await fetchFileContent(repo.owner, repo.repo, repo.defaultBranch, path);
-    fileContentCacheRef.current[path] = content;
-    setFileContents((prev) => (prev[path] === content ? prev : { ...prev, [path]: content }));
-    return content;
+    if (!pendingFileContentRequestsRef.current[path]) {
+      pendingFileContentRequestsRef.current[path] = fetchFileContent(
+        repo.owner,
+        repo.repo,
+        repo.defaultBranch,
+        path
+      ).then((content) => {
+        fileContentCacheRef.current[path] = content;
+
+        if (!fileSymbolCacheRef.current[path]) {
+          const names = extractFunctionNamesFromContent(content);
+          fileSymbolCacheRef.current[path] = names;
+          for (const name of names) {
+            const normalizedName = name.toLowerCase();
+            const files = symbolFileMapRef.current[normalizedName] || [];
+            if (!files.includes(path)) {
+              symbolFileMapRef.current[normalizedName] = [...files, path];
+            }
+          }
+        }
+
+        setFileContents((prev) => (prev[path] === content ? prev : { ...prev, [path]: content }));
+        delete pendingFileContentRequestsRef.current[path];
+        return content;
+      }).catch((error) => {
+        delete pendingFileContentRequestsRef.current[path];
+        throw error;
+      });
+    }
+
+    return pendingFileContentRequestsRef.current[path];
   };
 
-  const locateFunctionDefinition = async (input: {
+  const buildRepositorySymbolIndex = async (repo: GithubRepoInfo, filePaths: string[]) => {
+    const startedAt = Date.now();
+    const candidatePaths = rankSymbolIndexPaths(filePaths)
+      .slice(0, MAX_INDEX_FILES)
+      .filter((path) => !fileSymbolCacheRef.current[path]);
+
+    if (candidatePaths.length === 0) {
+      return;
+    }
+
+    addLog(`开始预建本地函数索引，目标文件 ${candidatePaths.length} 个`, 'info', {
+      fileList: candidatePaths,
+    });
+
+    for (let start = 0; start < candidatePaths.length; start += INDEX_CONCURRENCY) {
+      const batch = candidatePaths.slice(start, start + INDEX_CONCURRENCY);
+      await Promise.all(batch.map((path) => getRepositoryFileContent(repo, path).catch(() => '')));
+    }
+
+    const indexedSymbolCount = Object.keys(symbolFileMapRef.current).length;
+    addStageLog(`本地函数索引构建完成，已收录 ${indexedSymbolCount} 个函数名`, startedAt, 'success');
+  };
+
+  const locateFunctionDefinitionLegacy = async (input: {
     repo: GithubRepoInfo;
     repoUrl: string;
     summary: string;
@@ -513,8 +1010,10 @@ export default function Analyze() {
     snippet: string;
     startLine: number;
     endLine: number;
-    stage: 'same_file' | 'ai_guess' | 'project_search';
+    stage: 'same_file' | 'indexed_search' | 'heuristic_search' | 'ai_guess' | 'project_search';
   } | null> => {
+    const startedAt = Date.now();
+
     if (isLikelyExternalFunctionName(input.functionName)) {
       addLog(`停止下钻 ${input.functionName}：疑似系统或库函数`, 'info');
       return null;
@@ -613,7 +1112,7 @@ export default function Analyze() {
     };
   };
 
-  const drillDownSubFunctions = async (input: {
+  const drillDownSubFunctionsLegacy = async (input: {
     repo: GithubRepoInfo;
     repoUrl: string;
     summary: string;
@@ -736,7 +1235,7 @@ export default function Analyze() {
     }
   }, [urlParam]);
 
-  const loadRepository = async (repoUrl: string) => {
+  const loadRepositoryLegacy = async (repoUrl: string) => {
     setError(null);
     setRepoInfo(null);
     setFiles([]);
@@ -773,7 +1272,7 @@ export default function Analyze() {
       addLog(`获取文件树成功，共 ${tree.length} 个文件/目录`, 'success');
 
       // Trigger AI Analysis
-      const analysisResult = await analyzeTree(tree);
+      const analysisResult = await analyzeTreeLegacy(tree);
       
       // Trigger Entry File Verification
       if (analysisResult && analysisResult.entryFiles && analysisResult.entryFiles.length > 0) {
@@ -788,7 +1287,7 @@ export default function Analyze() {
     }
   };
 
-  const verifyEntryFiles = async (analysis: ProjectAnalysis, repo: GithubRepoInfo, repoUrl: string, tree: GithubFileNode[]) => {
+  const verifyEntryFilesLegacy = async (analysis: ProjectAnalysis, repo: GithubRepoInfo, repoUrl: string, tree: GithubFileNode[]) => {
     setIsVerifyingEntry(true);
     setConfirmedEntryFile(null);
     addLog(`开始逐个研判 ${analysis.entryFiles.length} 个可能的入口文件...`, 'info');
@@ -874,7 +1373,7 @@ export default function Analyze() {
     setIsVerifyingEntry(false);
   };
 
-  const analyzeTree = async (tree: GithubFileNode[]): Promise<ProjectAnalysis | null> => {
+  const analyzeTreeLegacy = async (tree: GithubFileNode[]): Promise<ProjectAnalysis | null> => {
     setIsAiLoading(true);
     addLog('开始准备 AI 分析...', 'info');
     try {
@@ -916,6 +1415,244 @@ export default function Analyze() {
       }
     } catch (err: any) {
       console.error("AI Analysis failed:", err);
+      addLog(`AI 分析过程中发生异常: ${err.message}`, 'error');
+      return null;
+    } finally {
+      setIsAiLoading(false);
+    }
+  };
+
+  const loadRepository = async (repoUrl: string) => {
+    setError(null);
+    setRepoInfo(null);
+    setFiles([]);
+    setOpenedFiles([]);
+    setActiveFile(null);
+    setFileContents({});
+    setLoadingFiles({});
+    setAiAnalysis(null);
+    setConfirmedEntryFile(null);
+    setSubFunctionAnalysis(null);
+    setSelectedPanoramaNodeId('root');
+    setActivePanoramaNodeId(null);
+    setIsTreeLoading(true);
+    setLogs([]);
+    fileContentCacheRef.current = {};
+    pendingFileContentRequestsRef.current = {};
+    functionFileGuessCacheRef.current = {};
+    fileSymbolCacheRef.current = {};
+    symbolFileMapRef.current = {};
+    analyzablePathsRef.current = [];
+    analysisNodeCountRef.current = 0;
+
+    addLog(`开始校验 GitHub 地址: ${repoUrl}`, 'info');
+
+    try {
+      const repoInfoStartedAt = Date.now();
+      const parsed = parseGithubUrl(repoUrl);
+      if (!parsed) {
+        throw new Error('无效的 GitHub 地址');
+      }
+      addLog(`地址解析成功: ${parsed.owner}/${parsed.repo}`, 'success');
+
+      const info = await fetchRepoInfo(parsed.owner, parsed.repo);
+      setRepoInfo(info);
+      addStageLog(`已获取仓库信息，默认分支 ${info.defaultBranch}`, repoInfoStartedAt);
+
+      const treeStartedAt = Date.now();
+      const tree = await fetchFileTree(info.owner, info.repo, info.defaultBranch);
+      setFiles(tree);
+      setIsTreeLoading(false);
+      addStageLog(`已获取文件树，共 ${tree.length} 个文件或目录`, treeStartedAt);
+
+      const analysisResult = await analyzeTree(tree, info);
+      if (analysisResult && analysisResult.entryFiles.length > 0) {
+        await verifyEntryFiles(analysisResult, info, repoUrl, tree);
+      }
+    } catch (err: any) {
+      setError(err.message || '加载仓库失败');
+      addLog(`加载失败: ${err.message}`, 'error');
+    } finally {
+      setIsTreeLoading(false);
+    }
+  };
+
+  const verifyEntryFiles = async (analysis: ProjectAnalysis, repo: GithubRepoInfo, repoUrl: string, tree: GithubFileNode[]) => {
+    setIsVerifyingEntry(true);
+    setConfirmedEntryFile(null);
+    const candidateEntryFiles = analysis.entryFiles.slice(0, MAX_ENTRY_FILE_CANDIDATES);
+    addLog(`开始逐个研判 ${candidateEntryFiles.length} 个候选入口文件...`, 'info');
+
+    for (const path of candidateEntryFiles) {
+      const entryCheckStartedAt = Date.now();
+      addLog(`正在获取候选入口文件内容: ${path}`, 'info');
+
+      try {
+        const content = await getRepositoryFileContent(repo, path);
+        const lines = content.split('\n');
+        let contentToSend = content;
+
+        if (lines.length > 4000) {
+          const first2000 = lines.slice(0, 2000).join('\n');
+          const last2000 = lines.slice(-2000).join('\n');
+          contentToSend = `${first2000}\n\n... [中间省略 ${lines.length - 4000} 行] ...\n\n${last2000}`;
+          addLog(`文件 ${path} 超过 4000 行（共 ${lines.length} 行），已截取前后 2000 行`, 'info');
+        }
+
+        addLog(`正在调用 AI 验证入口文件: ${path}`, 'info');
+        const { analysis: entryAnalysis, requestPayload, responseText } = await analyzeEntryFile(
+          repoUrl,
+          analysis.summary,
+          analysis.mainLanguages,
+          path,
+          contentToSend
+        );
+
+        if (!entryAnalysis) {
+          addLog(`AI 研判失败: ${path}`, 'error', { request: requestPayload, response: responseText });
+          continue;
+        }
+
+        addStageLog(`入口文件验证完成：${path}`, entryCheckStartedAt, entryAnalysis.isEntryFile ? 'success' : 'info', {
+          request: requestPayload,
+          response: responseText,
+        });
+        addLog(`AI 研判完成: ${path} -> ${entryAnalysis.isEntryFile ? '是' : '否'}入口文件`, entryAnalysis.isEntryFile ? 'success' : 'info', {
+          request: requestPayload,
+          response: responseText,
+        });
+
+        if (!entryAnalysis.isEntryFile) {
+          continue;
+        }
+
+        setConfirmedEntryFile({ path, reason: entryAnalysis.reason });
+        addLog(`已确认项目入口文件: ${path}，停止后续研判。`, 'success');
+        setIsSubFunctionLoading(true);
+        addLog(`开始分析入口文件 ${path} 的关键子函数...`, 'info');
+
+        const allPaths = analyzablePathsRef.current.length > 0
+          ? analyzablePathsRef.current
+          : tree.filter((node) => node.type === 'blob').map((node) => node.path);
+
+        const localEntryFunction = detectEntryFunctionCandidate(path, content);
+        const aiEntryFunction =
+          !localEntryFunction && entryAnalysis.entryFunctionName
+            ? {
+                name: entryAnalysis.entryFunctionName,
+                snippet: findFunctionDefinitionInContent(entryAnalysis.entryFunctionName, content)?.snippet,
+                reason: entryAnalysis.entryFunctionReason || entryAnalysis.reason,
+              }
+            : null;
+        const resolvedEntryFunction = localEntryFunction || aiEntryFunction;
+
+        if (resolvedEntryFunction) {
+          addLog(`已识别入口函数候选: ${resolvedEntryFunction.name}（${resolvedEntryFunction.reason}）`, 'success');
+        } else {
+          addLog('未能直接识别命名入口函数，将继续从入口文件整体代码分析执行流程。', 'info');
+        }
+
+        const subAnalysisStartedAt = Date.now();
+        const { analysis: subAnalysis, requestPayload: subReq, responseText: subRes } = await analyzeSubFunctions(
+          repoUrl,
+          analysis.summary,
+          path,
+          resolvedEntryFunction?.snippet || contentToSend,
+          allPaths,
+          resolvedEntryFunction?.name
+        );
+
+        if (subAnalysis) {
+          analysisNodeCountRef.current = 1;
+          addStageLog(`入口函数关键子函数分析完成：${path}`, subAnalysisStartedAt, 'success', {
+            request: subReq,
+            response: subRes,
+          });
+          setSubFunctionAnalysis(subAnalysis);
+          setSelectedPanoramaNodeId('root');
+          setActivePanoramaNodeId('root');
+          addLog(`AI 子函数分析完成，共识别出 ${subAnalysis.subFunctions.length} 个关键子函数`, 'success', {
+            request: subReq,
+            response: subRes,
+          });
+          await handleSelectFile(path, repo);
+
+          await drillDownSubFunctions({
+            repo,
+            repoUrl,
+            summary: analysis.summary,
+            parentFunctionName: subAnalysis.entryFunctionName,
+            parentFilePath: path,
+            parentFileContent: content,
+            subFunctions: subAnalysis.subFunctions,
+            allFiles: allPaths,
+            depth: 1,
+            pathPrefix: [],
+          });
+        } else {
+          addStageLog(`入口函数关键子函数分析失败：${path}`, subAnalysisStartedAt, 'error', {
+            request: subReq,
+            response: subRes,
+          });
+          addLog('AI 子函数分析失败', 'error', { request: subReq, response: subRes });
+        }
+
+        setIsSubFunctionLoading(false);
+        setActivePanoramaNodeId(null);
+        break;
+      } catch (err: any) {
+        addLog(`获取或研判文件 ${path} 失败: ${err.message}`, 'error');
+      }
+    }
+
+    setIsVerifyingEntry(false);
+  };
+
+  const analyzeTree = async (tree: GithubFileNode[], repo: GithubRepoInfo): Promise<ProjectAnalysis | null> => {
+    setIsAiLoading(true);
+    const startedAt = Date.now();
+    addLog('开始准备 AI 分析...', 'info');
+
+    try {
+      const allPaths = tree.filter((node) => node.type === 'blob').map((node) => node.path);
+      const codeFiles = allPaths.filter(isAnalyzableCodeFile);
+      analyzablePathsRef.current = codeFiles;
+      const symbolIndexPromise = buildRepositorySymbolIndex(repo, codeFiles);
+
+      addLog(`过滤出 ${codeFiles.length} 个代码文件（总文件数: ${allPaths.length}）`, 'info', { fileList: codeFiles });
+
+      const filesToAnalyze = codeFiles.slice(0, 1000);
+      if (codeFiles.length > 1000) {
+        addLog('文件数量过多，截取前 1000 个文件进行分析', 'info', { fileList: filesToAnalyze });
+      }
+
+      addLog('正在调用 AI 接口进行项目画像分析...', 'info');
+      const { analysis, requestPayload, responseText } = await analyzeProjectFiles(filesToAnalyze);
+
+      if (!analysis) {
+        addStageLog('项目画像分析未返回有效结果', startedAt, 'error', { request: requestPayload, response: responseText });
+        addLog('AI 分析未返回有效结果', 'error', { request: requestPayload, response: responseText });
+        return null;
+      }
+
+      const rankedEntryFiles = rankEntryFileCandidates(allPaths, analysis.entryFiles || []).slice(0, MAX_ENTRY_FILE_CANDIDATES);
+      const normalizedAnalysis = {
+        ...analysis,
+        entryFiles: rankedEntryFiles.length > 0 ? rankedEntryFiles : (analysis.entryFiles || []).slice(0, MAX_ENTRY_FILE_CANDIDATES),
+      };
+
+      await symbolIndexPromise;
+
+      addStageLog(`项目画像分析完成，候选入口文件 ${normalizedAnalysis.entryFiles.length} 个`, startedAt, 'success', {
+        request: requestPayload,
+        response: responseText,
+      });
+      addLog('AI 分析成功', 'success', { request: requestPayload, response: responseText });
+      setAiAnalysis(normalizedAnalysis);
+      return normalizedAnalysis;
+    } catch (err: any) {
+      console.error('AI Analysis failed:', err);
+      addStageLog(`AI 分析过程中发生异常: ${err.message}`, startedAt, 'error');
       addLog(`AI 分析过程中发生异常: ${err.message}`, 'error');
       return null;
     } finally {

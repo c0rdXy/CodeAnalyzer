@@ -7,6 +7,17 @@ export interface FunctionMatch {
 
 const PYTHON_SIGNATURE_RE = /^\s*(?:async\s+def|def)\s+/;
 const RUBY_SIGNATURE_RE = /^\s*def\s+/;
+const FUNCTION_NAME_CAPTURE_PATTERNS = [
+  /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/,
+  /^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?function\s*\(/,
+  /^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/,
+  /^\s*(?:async\s+def|def)\s+([A-Za-z_][\w]*)\s*\(/,
+  /^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_][\w]*)\s*\(/,
+  /^\s*(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z_][\w]*)\s*(?:<[^>]+>)?\s*\(/,
+  /^\s*(?:public|private|protected|static|final|abstract\s+)?function\s+([A-Za-z_][\w]*)\s*\(/,
+  /^\s*def\s+([A-Za-z_][\w]*)\b/,
+  /^\s*(?:public|private|protected|internal|static|final|virtual|override|abstract|async|synchronized|inline\s+)*[A-Za-z_$][\w<>,\[\].?]*\s+([A-Za-z_$][\w$]*)\s*\(/,
+];
 
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -228,28 +239,54 @@ export function findFunctionDefinitionInContent(functionName: string, content: s
   return null;
 }
 
+export function extractFunctionNamesFromContent(content: string): string[] {
+  const names = new Set<string>();
+  const lines = content.split('\n');
+
+  for (const line of lines) {
+    for (const pattern of FUNCTION_NAME_CAPTURE_PATTERNS) {
+      const match = line.match(pattern);
+      if (match?.[1]) {
+        names.add(match[1]);
+        break;
+      }
+    }
+  }
+
+  return [...names];
+}
+
 export async function searchFunctionInFiles(input: {
   functionName: string;
   filePaths: string[];
   getFileContent: (path: string) => Promise<string>;
+  concurrency?: number;
 }): Promise<{ filePath: string; match: FunctionMatch } | null> {
   const visited = new Set<string>();
+  const concurrency = Math.max(1, input.concurrency ?? 6);
 
-  for (const filePath of input.filePaths) {
-    if (!filePath || visited.has(filePath)) {
-      continue;
-    }
-    visited.add(filePath);
+  for (let start = 0; start < input.filePaths.length; start += concurrency) {
+    const batch = input.filePaths
+      .slice(start, start + concurrency)
+      .filter((filePath) => filePath && !visited.has(filePath));
 
-    try {
-      const content = await input.getFileContent(filePath);
-      const match = findFunctionDefinitionInContent(input.functionName, content);
+    batch.forEach((filePath) => visited.add(filePath));
 
-      if (match) {
-        return { filePath, match };
-      }
-    } catch {
-      // Ignore fetch or parse errors and continue searching.
+    const results = await Promise.all(
+      batch.map(async (filePath) => {
+        try {
+          const content = await input.getFileContent(filePath);
+          const match = findFunctionDefinitionInContent(input.functionName, content);
+          return match ? { filePath, match } : null;
+        } catch {
+          return null;
+        }
+      })
+    );
+
+    const matched = results.find(Boolean);
+    if (matched) {
+      return matched;
     }
   }
 
