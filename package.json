@@ -1,7 +1,7 @@
 {
   "name": "code-analyzer",
   "private": true,
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "AI-powered GitHub repository code analyzer with entry detection, recursive function drill-down, and panorama visualization.",
   "type": "module",
   "scripts": {

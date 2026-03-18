@@ -1,3 +1,5 @@
+import { getRuntimeConfig } from './runtimeConfig';
+
 export interface GithubRepoInfo {
   owner: string;
   repo: string;
@@ -13,8 +15,10 @@ export interface GithubFileNode {
   url: string;
 }
 
-export const getGithubToken = () => localStorage.getItem('github_pat') || '';
-export const setGithubToken = (token: string) => localStorage.setItem('github_pat', token);
+export const getGithubToken = () => {
+  const runtime = getRuntimeConfig();
+  return (runtime.GITHUB_TOKEN || runtime.GITHUB_PAT || '').trim();
+};
 
 const fetchWithAuth = async (url: string, customHeaders: Record<string, string> = {}) => {
   const token = getGithubToken();

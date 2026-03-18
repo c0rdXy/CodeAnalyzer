@@ -1,62 +1,27 @@
+import { getRuntimeConfig } from '../utils/runtimeConfig';
+
 type JsonRecord = Record<string, unknown>;
-type AiOperation = 'project' | 'entry' | 'function' | 'file_guess';
+type AiOperation = 'project' | 'entry' | 'function' | 'file_guess' | 'module';
 
-const DEFAULT_MODEL =
-  process.env.AI_MODEL ||
-  process.env.GEMINI_MODEL ||
-  'gemini-2.5-flash';
+const FALLBACK_MODEL = 'gemini-2.5-flash';
+const FALLBACK_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/openai';
+const FALLBACK_TIMEOUT_MS = 60000;
+const FALLBACK_MAX_OUTPUT_TOKENS = 2000;
 
-const DEFAULT_PROJECT_MODEL =
-  process.env.AI_MODEL_PROJECT ||
-  process.env.AI_MODEL_FAST ||
-  DEFAULT_MODEL;
+function parseBoolean(value: string, fallback: boolean): boolean {
+  if (!value) {
+    return fallback;
+  }
+  return value.trim().toLowerCase() !== 'false';
+}
 
-const DEFAULT_ENTRY_MODEL =
-  process.env.AI_MODEL_ENTRY ||
-  process.env.AI_MODEL_FAST ||
-  DEFAULT_MODEL;
-
-const DEFAULT_FUNCTION_MODEL =
-  process.env.AI_MODEL_FUNCTION ||
-  DEFAULT_MODEL;
-
-const DEFAULT_FILE_GUESS_MODEL =
-  process.env.AI_MODEL_FILE_GUESS ||
-  process.env.AI_MODEL_FAST ||
-  DEFAULT_MODEL;
-
-const DEFAULT_BASE_URL =
-  process.env.GEMINIBASE_URL ||
-  process.env.GEMINI_BASE_URL ||
-  'https://generativelanguage.googleapis.com/v1beta/openai';
-
-const DEFAULT_API_KEY =
-  process.env.AI_API_KEY ||
-  process.env.GEMINI_API_KEY ||
-  process.env.OPENAI_API_KEY ||
-  '';
-
-const DEFAULT_USE_STREAM =
-  (process.env.AI_USE_STREAM || 'true').trim().toLowerCase() !== 'false';
-
-const DEFAULT_ENABLE_THINKING =
-  (process.env.AI_ENABLE_THINKING || 'false').trim().toLowerCase() === 'true';
-
-const DEFAULT_REQUEST_TIMEOUT_MS = (() => {
-  const parsed = Number(process.env.AI_REQUEST_TIMEOUT_MS || '60000');
-  if (!Number.isFinite(parsed) || parsed < 1000) {
-    return 60000;
+function parseNumberWithMin(value: string, fallback: number, min: number): number {
+  const parsed = Number(value || '');
+  if (!Number.isFinite(parsed) || parsed < min) {
+    return fallback;
   }
   return Math.floor(parsed);
-})();
-
-const DEFAULT_MAX_OUTPUT_TOKENS = (() => {
-  const parsed = Number(process.env.AI_MAX_OUTPUT_TOKENS || '2000');
-  if (!Number.isFinite(parsed) || parsed < 256) {
-    return 2000;
-  }
-  return Math.floor(parsed);
-})();
+}
 
 export interface ProjectAnalysis {
   mainLanguages: string[];
@@ -101,6 +66,25 @@ export interface FunctionFileGuess {
   candidateFiles: string[];
   reason: string;
   isProjectFunction: boolean;
+}
+
+export interface ModuleFunctionNodeInput {
+  nodeId: string;
+  functionName: string;
+  description: string;
+  filePath?: string;
+  parentNodeId?: string;
+}
+
+export interface FunctionModuleGroup {
+  moduleId: string;
+  moduleName: string;
+  description: string;
+  functionNodeIds: string[];
+}
+
+export interface FunctionModuleAnalysis {
+  modules: FunctionModuleGroup[];
 }
 
 interface AiRuntimeConfig {
@@ -159,25 +143,39 @@ function normalizeBaseUrl(baseUrl: string): string {
 }
 
 function resolveModelByOperation(operation: AiOperation): string {
+  const runtime = getRuntimeConfig();
+  const defaultModel = (runtime.AI_MODEL || runtime.AI_MODEL_FAST || FALLBACK_MODEL).trim();
+
   if (operation === 'project') {
-    return DEFAULT_PROJECT_MODEL.trim();
+    return (runtime.AI_MODEL_PROJECT || runtime.AI_MODEL_FAST || defaultModel).trim();
   }
   if (operation === 'entry') {
-    return DEFAULT_ENTRY_MODEL.trim();
+    return (runtime.AI_MODEL_ENTRY || runtime.AI_MODEL_FAST || defaultModel).trim();
   }
   if (operation === 'file_guess') {
-    return DEFAULT_FILE_GUESS_MODEL.trim();
+    return (runtime.AI_MODEL_FILE_GUESS || runtime.AI_MODEL_FAST || defaultModel).trim();
   }
-  return DEFAULT_FUNCTION_MODEL.trim();
+  if (operation === 'module') {
+    return (runtime.AI_MODEL_MODULE || runtime.AI_MODEL_FAST || defaultModel).trim();
+  }
+  return (runtime.AI_MODEL_FUNCTION || defaultModel).trim();
 }
 
 function getAiConfig(options: CallAiOptions): AiRuntimeConfig {
-  const apiKey = DEFAULT_API_KEY.trim();
+  const runtime = getRuntimeConfig();
+  const apiKey = (runtime.AI_API_KEY || runtime.GEMINI_API_KEY || runtime.OPENAI_API_KEY || '').trim();
   const model = resolveModelByOperation(options.operation);
-  const baseUrl = DEFAULT_BASE_URL.trim();
+  const baseUrl = (runtime.GEMINIBASE_URL || runtime.GEMINI_BASE_URL || FALLBACK_BASE_URL).trim();
   const endpoint = normalizeBaseUrl(baseUrl);
-  const useStream = DEFAULT_USE_STREAM;
-  const enableThinking = options.enableThinking ?? DEFAULT_ENABLE_THINKING;
+  const useStream = parseBoolean(runtime.AI_USE_STREAM || 'true', true);
+  const thinkingEnabledByConfig = (runtime.AI_ENABLE_THINKING || '').trim().toLowerCase() === 'true';
+  const enableThinking = options.enableThinking ?? thinkingEnabledByConfig;
+  const timeoutMs = parseNumberWithMin(runtime.AI_REQUEST_TIMEOUT_MS || '', FALLBACK_TIMEOUT_MS, 1000);
+  const maxOutputTokens = parseNumberWithMin(
+    runtime.AI_MAX_OUTPUT_TOKENS || '',
+    FALLBACK_MAX_OUTPUT_TOKENS,
+    256
+  );
 
   if (!apiKey) {
     throw new Error('Missing AI API key. Set AI_API_KEY or GEMINI_API_KEY in your .env file.');
@@ -198,8 +196,8 @@ function getAiConfig(options: CallAiOptions): AiRuntimeConfig {
     endpoint,
     useStream,
     enableThinking,
-    timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
-    maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS,
+    timeoutMs,
+    maxOutputTokens,
   };
 }
 
@@ -317,14 +315,14 @@ async function callAiJson<T>(
     temperature: 0.1,
   };
 
-  const sendRequest = async (thinkingEnabled: boolean) => {
+  const sendRequest = async (thinkingEnabled: boolean, streamEnabled: boolean) => {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     const requestBody: Record<string, unknown> = {
       model,
       messages: requestPayload.messages,
       temperature: requestPayload.temperature,
-      stream: useStream,
+      stream: streamEnabled,
       max_tokens: maxOutputTokens,
     };
 
@@ -361,7 +359,7 @@ async function callAiJson<T>(
         throw new Error(`AI request failed (${response.status}): ${message}`);
       }
 
-      if (useStream) {
+      if (streamEnabled) {
         return await readChatCompletionStream(response);
       }
 
@@ -386,7 +384,7 @@ async function callAiJson<T>(
 
   let responseText = '';
   try {
-    responseText = await sendRequest(enableThinking);
+    responseText = await sendRequest(enableThinking, useStream);
   } catch (error) {
     if (
       enableThinking &&
@@ -394,9 +392,23 @@ async function callAiJson<T>(
       /(thinking|extra_body|unsupported|invalid_parameter|unknown parameter)/i.test(error.message)
     ) {
       requestPayload.thinkingFallback = true;
-      responseText = await sendRequest(false);
+      responseText = await sendRequest(false, useStream);
     } else {
       throw error;
+    }
+  }
+
+  if (!responseText) {
+    if (useStream) {
+      requestPayload.streamFallback = true;
+      responseText = await sendRequest(enableThinking, false);
+    }
+  }
+
+  if (!responseText) {
+    if (enableThinking) {
+      requestPayload.thinkingFallbackAfterEmpty = true;
+      responseText = await sendRequest(false, false);
     }
   }
 
@@ -514,10 +526,10 @@ function buildFunctionAnalysisPrompt(input: {
     '  "stopReason": "If shouldStop is true, explain the reason in Simplified Chinese.",',
     '  "subFunctions": [',
     '    {',
-    '      "name": "child function name",',
-    '      "file": "most likely project file path, or empty string if unknown",',
-    '      "description": "Use Simplified Chinese to explain what this child function does.",',
-    '      "drillDown": 1',
+    '      "name": "child function name (method should include class name, for example ClassName::methodName)",',
+      '      "file": "most likely project file path, or empty string if unknown",',
+      '      "description": "Use Simplified Chinese to explain what this child function does.",',
+      '      "drillDown": 1',
     '    }',
     '  ]',
     '}',
@@ -526,6 +538,11 @@ function buildFunctionAnalysisPrompt(input: {
     '- Use Simplified Chinese for summary, stopReason, and description.',
     '- Return at most 6 child functions.',
     '- Only keep the truly critical child functions that are necessary to understand the main execution flow.',
+    '- Do not return trivial helper calls such as common data-structure operations, string formatting/parsing, logging, simple getters/setters, or shallow data conversion unless they directly decide core control flow.',
+    '- Prefer child functions that represent business orchestration, external I/O boundaries, state transition, permission/auth decision, transaction/persistence, or key protocol flow.',
+    '- For object-oriented languages, methods must include class-qualified names when possible.',
+    '- For C/C++, use ClassName::FunctionName (or Namespace::ClassName::FunctionName if known).',
+    '- For Java/C#/Kotlin, prefer ClassName.methodName.',
     '- Use drillDown = 1 only for functions that are highly likely to deserve continued drill-down analysis.',
     '- Use drillDown = 0 sparingly for borderline cases.',
     '- drillDown must be -1, 0, or 1.',
@@ -685,6 +702,75 @@ export async function analyzeProjectFiles(files: string[]): Promise<AIAnalysisRe
       requestPayload: {
         error: String(error),
         operation: 'analyzeProjectFiles',
+      },
+      responseText: String(error),
+    };
+  }
+}
+
+export async function analyzeFunctionModules(input: {
+  repoUrl: string;
+  summary: string;
+  mainLanguages: string[];
+  techStack: string[];
+  functionNodes: ModuleFunctionNodeInput[];
+}): Promise<{ analysis: FunctionModuleAnalysis | null; requestPayload: JsonRecord; responseText: string | null }> {
+  const functionNodeList = input.functionNodes
+    .slice(0, 200)
+    .map((node) =>
+      [
+        `nodeId: ${node.nodeId}`,
+        `functionName: ${node.functionName}`,
+        `description: ${node.description || '暂无描述'}`,
+        `filePath: ${node.filePath || '未知文件'}`,
+        `parentNodeId: ${node.parentNodeId || '无'}`,
+      ].join(' | ')
+    )
+    .join('\n');
+
+  const prompt = [
+    'Please group the following analyzed function nodes into business modules.',
+    '',
+    `Repository URL: ${input.repoUrl}`,
+    `Project summary: ${input.summary}`,
+    `Main languages: ${input.mainLanguages.join(', ')}`,
+    `Tech stack: ${input.techStack.join(', ')}`,
+    '',
+    'Function node list:',
+    functionNodeList,
+    '',
+    'Return JSON only in this shape:',
+    '{',
+    '  "modules": [',
+    '    {',
+    '      "moduleId": "module-auth",',
+    '      "moduleName": "用户认证模块",',
+    '      "description": "该模块负责登录、鉴权与会话管理",',
+    '      "functionNodeIds": ["root", "node-0", "node-0-1"]',
+    '    }',
+    '  ]',
+    '}',
+    '',
+    'Rules:',
+    '- module count must be between 1 and 10.',
+    '- moduleName and description must be Simplified Chinese.',
+    '- Every function node must belong to exactly one module.',
+    '- functionNodeIds must use nodeId from the given list only.',
+    '- Prefer meaningful, business-oriented module boundaries instead of purely technical layering.',
+  ].join('\n');
+
+  try {
+    return await callAiJson<FunctionModuleAnalysis>(prompt, {
+      operation: 'module',
+      enableThinking: false,
+    });
+  } catch (error) {
+    console.error('AI module analysis failed:', error);
+    return {
+      analysis: null,
+      requestPayload: {
+        error: String(error),
+        operation: 'analyzeFunctionModules',
       },
       responseText: String(error),
     };

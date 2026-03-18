@@ -23,21 +23,82 @@ function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function buildDefinitionPatterns(functionName: string): RegExp[] {
-  const name = escapeRegex(functionName);
+function normalizeFunctionName(functionName: string): string {
+  return functionName
+    .trim()
+    .replace(/\s+/g, '')
+    .replace(/\([^)]*\)\s*$/, '');
+}
 
-  return [
-    new RegExp(`^\\s*(?:export\\s+)?(?:default\\s+)?(?:async\\s+)?function\\s+${name}\\s*\\(`),
-    new RegExp(`^\\s*(?:export\\s+)?(?:const|let|var)\\s+${name}\\s*=\\s*(?:async\\s*)?function\\s*\\(`),
-    new RegExp(`^\\s*(?:export\\s+)?(?:const|let|var)\\s+${name}\\s*=\\s*(?:async\\s*)?(?:\\([^)]*\\)|[A-Za-z_$][\\w$]*)\\s*=>`),
-    new RegExp(`^\\s*(?:public|private|protected|static|async|override|virtual|internal|final|abstract|sealed|export\\s+)?\\s*(?:async\\s+)?${name}\\s*\\(`),
-    new RegExp(`^\\s*(?:async\\s+def|def)\\s+${name}\\s*\\(`),
-    new RegExp(`^\\s*func\\s+(?:\\([^)]*\\)\\s*)?${name}\\s*\\(`),
-    new RegExp(`^\\s*(?:pub\\s+)?(?:async\\s+)?fn\\s+${name}\\s*(?:<[^>]+>)?\\s*\\(`),
-    new RegExp(`^\\s*(?:public|private|protected|static|final|abstract\\s+)?function\\s+${name}\\s*\\(`),
-    new RegExp(`^\\s*def\\s+${name}\\b`),
-    new RegExp(`^\\s*(?:public|private|protected|internal|static|final|virtual|override|abstract|async|synchronized|inline\\s+)*[A-Za-z_$][\\w<>,\\[\\].?]*\\s+${name}\\s*\\(`),
+function parseFunctionName(functionName: string): {
+  normalized: string;
+  simpleName: string;
+  qualifiers: string[];
+  cppQualifiedName: string;
+} {
+  const normalized = normalizeFunctionName(functionName);
+  const tokens = normalized.split(/::|\.|#/).filter(Boolean);
+  const simpleName = tokens[tokens.length - 1] || normalized;
+  const qualifiers = tokens.slice(0, -1);
+  const cppQualifiedName =
+    qualifiers.length > 0 && simpleName ? `${qualifiers.join('::')}::${simpleName}` : '';
+
+  return {
+    normalized,
+    simpleName,
+    qualifiers,
+    cppQualifiedName,
+  };
+}
+
+export function getFunctionNameLookupKeys(functionName: string): string[] {
+  const parsed = parseFunctionName(functionName);
+  const keys = [
+    functionName.trim().toLowerCase(),
+    parsed.normalized.toLowerCase(),
+    parsed.simpleName.toLowerCase(),
   ];
+
+  if (parsed.cppQualifiedName) {
+    keys.push(parsed.cppQualifiedName.toLowerCase());
+  }
+
+  if (parsed.qualifiers.length > 0) {
+    const className = parsed.qualifiers[parsed.qualifiers.length - 1];
+    keys.push(`${className}::${parsed.simpleName}`.toLowerCase());
+    keys.push(`${className}.${parsed.simpleName}`.toLowerCase());
+  }
+
+  return [...new Set(keys.filter(Boolean))];
+}
+
+function buildDefinitionPatterns(functionName: string): RegExp[] {
+  const parsed = parseFunctionName(functionName);
+  const safeName = escapeRegex(parsed.simpleName || functionName.trim());
+  const patterns: RegExp[] = [
+    new RegExp(`^\\s*(?:export\\s+)?(?:default\\s+)?(?:async\\s+)?function\\s+${safeName}\\s*\\(`),
+    new RegExp(`^\\s*(?:export\\s+)?(?:const|let|var)\\s+${safeName}\\s*=\\s*(?:async\\s*)?function\\s*\\(`),
+    new RegExp(`^\\s*(?:export\\s+)?(?:const|let|var)\\s+${safeName}\\s*=\\s*(?:async\\s*)?(?:\\([^)]*\\)|[A-Za-z_$][\\w$]*)\\s*=>`),
+    new RegExp(`^\\s*(?:public|private|protected|static|async|override|virtual|internal|final|abstract|sealed|export\\s+)?\\s*(?:async\\s+)?${safeName}\\s*\\(`),
+    new RegExp(`^\\s*(?:async\\s+def|def)\\s+${safeName}\\s*\\(`),
+    new RegExp(`^\\s*func\\s+(?:\\([^)]*\\)\\s*)?${safeName}\\s*\\(`),
+    new RegExp(`^\\s*(?:pub\\s+)?(?:async\\s+)?fn\\s+${safeName}\\s*(?:<[^>]+>)?\\s*\\(`),
+    new RegExp(`^\\s*(?:public|private|protected|static|final|abstract\\s+)?function\\s+${safeName}\\s*\\(`),
+    new RegExp(`^\\s*def\\s+${safeName}\\b`),
+    new RegExp(`^\\s*(?:public|private|protected|internal|static|final|virtual|override|abstract|async|synchronized|inline\\s+)*[A-Za-z_$][\\w<>,\\[\\].?]*\\s+${safeName}\\s*\\(`),
+    new RegExp(`^\\s*(?:public|private|protected|internal|static|virtual|inline|constexpr|explicit|friend\\s+)*~?${safeName}\\s*\\(`),
+  ];
+
+  if (parsed.cppQualifiedName) {
+    const qualified = escapeRegex(parsed.cppQualifiedName);
+    patterns.unshift(
+      new RegExp(`^\\s*(?:template\\s*<[^>]+>\\s*)?(?:inline\\s+|static\\s+|virtual\\s+|constexpr\\s+|friend\\s+|extern\\s+|typename\\s+)*[A-Za-z_$~][\\w:<>,\\[\\]().*&\\s]*\\b${qualified}\\s*\\(`)
+    );
+    patterns.unshift(new RegExp(`^\\s*(?:inline\\s+|constexpr\\s+)?${qualified}\\s*\\(`));
+    patterns.unshift(new RegExp(`\\b${qualified}\\s*\\(`));
+  }
+
+  return patterns;
 }
 
 function countLineIndent(line: string): number {
@@ -210,9 +271,39 @@ function extractBraceBlock(content: string, lines: string[], startLineIndex: num
   };
 }
 
+function isLikelyInsideClass(lines: string[], startLineIndex: number, classNames: string[]): boolean {
+  if (classNames.length === 0) {
+    return false;
+  }
+
+  const maxScanLines = 220;
+  const end = Math.max(0, startLineIndex - maxScanLines);
+  for (let index = startLineIndex; index >= end; index -= 1) {
+    const line = lines[index];
+
+    for (const className of classNames) {
+      const classPattern = new RegExp(`\\b(?:class|struct)\\s+${escapeRegex(className)}\\b`);
+      if (classPattern.test(line)) {
+        return true;
+      }
+    }
+
+    if (index < startLineIndex - 2 && /^\s*}\s*;?\s*$/.test(line)) {
+      break;
+    }
+  }
+
+  return false;
+}
+
 export function findFunctionDefinitionInContent(functionName: string, content: string): FunctionMatch | null {
+  const parsed = parseFunctionName(functionName);
+  const classCandidates = parsed.qualifiers.length > 0 ? [parsed.qualifiers[parsed.qualifiers.length - 1]] : [];
+  const normalizedQualifiedName = parsed.cppQualifiedName.replace(/\s+/g, '').toLowerCase();
+  const normalizedSimpleName = parsed.simpleName.replace(/\s+/g, '').toLowerCase();
   const patterns = buildDefinitionPatterns(functionName);
   const lines = content.split('\n');
+  const candidateIndexes: number[] = [];
 
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
@@ -221,6 +312,43 @@ export function findFunctionDefinitionInContent(functionName: string, content: s
     if (!matchesDefinition) {
       continue;
     }
+
+    candidateIndexes.push(index);
+  }
+
+  if (candidateIndexes.length === 0) {
+    return null;
+  }
+
+  const scoredIndexes = [...candidateIndexes].sort((leftIndex, rightIndex) => {
+    const score = (line: string, index: number) => {
+      let value = 0;
+      const normalizedLine = line.replace(/\s+/g, '').toLowerCase();
+
+      if (normalizedQualifiedName && normalizedLine.includes(normalizedQualifiedName)) {
+        value += 240;
+      }
+
+      if (normalizedSimpleName && normalizedLine.includes(normalizedSimpleName)) {
+        value += 30;
+      }
+
+      if (isLikelyInsideClass(lines, index, classCandidates)) {
+        value += 110;
+      }
+
+      if (/\b(if|for|while|switch)\b/.test(line)) {
+        value -= 120;
+      }
+
+      return value;
+    };
+
+    return score(lines[rightIndex], rightIndex) - score(lines[leftIndex], leftIndex);
+  });
+
+  for (const index of scoredIndexes) {
+    const line = lines[index];
 
     if (PYTHON_SIGNATURE_RE.test(line)) {
       return extractIndentedBlock(lines, index);
@@ -299,7 +427,12 @@ export function prioritizeSearchPaths(input: {
   parentFilePath?: string;
   hintedFiles?: string[];
 }): string[] {
-  const normalizedName = input.functionName.toLowerCase();
+  const lookupKeys = getFunctionNameLookupKeys(input.functionName);
+  const normalizedName = lookupKeys[2] || lookupKeys[1] || lookupKeys[0] || input.functionName.toLowerCase();
+  const qualifierTerms = lookupKeys
+    .filter((key) => key.includes('::') || key.includes('.'))
+    .map((key) => key.split(/::|\./).slice(0, -1).join('/'))
+    .filter(Boolean);
   const parentDir = input.parentFilePath?.includes('/')
     ? input.parentFilePath.slice(0, input.parentFilePath.lastIndexOf('/'))
     : '';
@@ -320,6 +453,12 @@ export function prioritizeSearchPaths(input: {
     }
     if (lower.includes(normalizedName)) {
       score += 8;
+    }
+    if (lookupKeys.some((key) => key && lower.includes(key))) {
+      score += 4;
+    }
+    if (qualifierTerms.some((term) => term && lower.includes(term.toLowerCase()))) {
+      score += 3;
     }
     if (lower.endsWith('.ts') || lower.endsWith('.tsx') || lower.endsWith('.js') || lower.endsWith('.jsx')) {
       score += 2;

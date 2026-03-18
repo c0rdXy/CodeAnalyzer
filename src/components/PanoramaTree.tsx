@@ -1,4 +1,4 @@
-﻿import React from 'react';
+import React, { useLayoutEffect, useRef, useState } from 'react';
 import { TransformWrapper, TransformComponent } from 'react-zoom-pan-pinch';
 import { EntryFunctionAnalysis, SubFunctionAnalysis } from '../services/analysisAi';
 import { Maximize, ZoomIn, ZoomOut } from 'lucide-react';
@@ -8,6 +8,9 @@ interface PanoramaTreeProps {
   entryFilePath: string;
   selectedNodeId: string;
   activeNodeId: string | null;
+  nodeModuleMap?: Record<string, string>;
+  moduleColorMap?: Record<string, string>;
+  activeModuleId?: string | null;
   onSelectNode: (
     nodeId: string,
     node: { filePath?: string; snippet?: string }
@@ -23,8 +26,13 @@ interface NodeCardProps {
   stopReason?: string;
   selectedNodeId: string;
   activeNodeId: string | null;
+  moduleColor?: string;
+  isDimmed?: boolean;
   onClick: () => void;
 }
+
+const CONNECTOR_X = 20;
+const CONNECTOR_END_X = 56;
 
 const getDrillDownLabel = (drillDown?: number) => {
   if (drillDown === 1) {
@@ -45,6 +53,8 @@ const NodeCard = ({
   stopReason,
   selectedNodeId,
   activeNodeId,
+  moduleColor,
+  isDimmed,
   onClick,
 }: NodeCardProps) => {
   const isSelected = selectedNodeId === id;
@@ -55,6 +65,8 @@ const NodeCard = ({
       type="button"
       onClick={onClick}
       className={`panorama-node-enter w-72 overflow-hidden rounded-xl border-2 text-left shadow-lg transition-all ${
+        isDimmed ? 'opacity-30 grayscale' : 'opacity-100'
+      } ${
         isSelected
           ? 'border-emerald-400 bg-zinc-900 ring-2 ring-emerald-400/40'
           : isActive
@@ -62,7 +74,10 @@ const NodeCard = ({
             : 'border-zinc-700 bg-zinc-900 hover:border-zinc-500'
       }`}
     >
-      <div className="truncate border-b-2 border-inherit bg-zinc-800 px-3 py-1.5 text-xs font-mono text-zinc-300">
+      <div
+        className="truncate border-b-2 border-inherit px-3 py-1.5 text-xs font-mono text-zinc-100"
+        style={{ backgroundColor: moduleColor || '#27272a' }}
+      >
         {title}
       </div>
       <div className="flex flex-col gap-1.5 p-3">
@@ -86,17 +101,193 @@ const NodeCard = ({
   );
 };
 
+const TreeNodeItem = ({
+  node,
+  index,
+  total,
+  path,
+  selectedNodeId,
+  activeNodeId,
+  nodeModuleMap,
+  moduleColorMap,
+  activeModuleId,
+  parentConnectorOffset,
+  onSelectNode,
+}: {
+  node: SubFunctionAnalysis;
+  index: number;
+  total: number;
+  path: number[];
+  selectedNodeId: string;
+  activeNodeId: string | null;
+  nodeModuleMap?: Record<string, string>;
+  moduleColorMap?: Record<string, string>;
+  activeModuleId?: string | null;
+  parentConnectorOffset: number;
+  onSelectNode: PanoramaTreeProps['onSelectNode'];
+}) => {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const cardWrapperRef = useRef<HTMLDivElement | null>(null);
+  const [metrics, setMetrics] = useState({
+    height: 140,
+    cardCenterY: 64,
+  });
+
+  useLayoutEffect(() => {
+    if (!containerRef.current || !cardWrapperRef.current) {
+      return;
+    }
+
+    let frameId = 0;
+    const measure = () => {
+      cancelAnimationFrame(frameId);
+      frameId = requestAnimationFrame(() => {
+        if (!containerRef.current || !cardWrapperRef.current) {
+          return;
+        }
+
+        const containerRect = containerRef.current.getBoundingClientRect();
+        const cardRect = cardWrapperRef.current.getBoundingClientRect();
+        const height = Math.max(containerRect.height, 1);
+        const cardCenterY = cardRect.top - containerRect.top + cardRect.height / 2;
+
+        setMetrics((prev) => {
+          if (
+            Math.abs(prev.height - height) < 0.5 &&
+            Math.abs(prev.cardCenterY - cardCenterY) < 0.5
+          ) {
+            return prev;
+          }
+
+          return {
+            height,
+            cardCenterY,
+          };
+        });
+      });
+    };
+
+    measure();
+
+    const observer = new ResizeObserver(measure);
+    observer.observe(containerRef.current);
+    observer.observe(cardWrapperRef.current);
+
+    window.addEventListener('resize', measure);
+
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', measure);
+      cancelAnimationFrame(frameId);
+    };
+  }, [node.description, node.stopReason, node.name, node.children?.length]);
+
+  const nextPath = [...path, index];
+  const nodeId = `node-${nextPath.join('-')}`;
+  const moduleId = nodeModuleMap?.[nodeId];
+  const moduleColor = moduleId ? moduleColorMap?.[moduleId] : undefined;
+  const isDimmed = Boolean(activeModuleId && moduleId !== activeModuleId);
+  const isSelected = selectedNodeId === nodeId;
+  const isActive = activeNodeId === nodeId;
+
+  const isFirst = index === 0;
+  const isLast = index === total - 1;
+
+  const verticalStart = isFirst ? -parentConnectorOffset : 0;
+  const verticalEnd = isLast ? metrics.cardCenterY : metrics.height;
+  const horizontalEnd = CONNECTOR_END_X;
+  const connectorColor = moduleColor || '#a1a1aa';
+  const connectorOpacity = isDimmed ? 0.22 : isSelected ? 1 : isActive ? 0.95 : 0.86;
+  const connectorStyle = {
+    ['--connector-color' as string]: connectorColor,
+    ['--connector-opacity' as string]: String(connectorOpacity),
+  } as React.CSSProperties;
+
+  return (
+    <div ref={containerRef} className={`relative ${isLast ? '' : 'pb-6'}`}>
+      <svg
+        style={connectorStyle}
+        className="panorama-connector-svg pointer-events-none absolute left-0 top-0 h-full w-16 overflow-visible"
+      >
+        <line
+          x1={CONNECTOR_X}
+          y1={verticalStart}
+          x2={CONNECTOR_X}
+          y2={verticalEnd}
+          className="panorama-connector-line"
+        />
+        <line
+          x1={CONNECTOR_X}
+          y1={metrics.cardCenterY}
+          x2={horizontalEnd - 8}
+          y2={metrics.cardCenterY}
+          className="panorama-connector-line"
+        />
+        <polygon
+          points={`${horizontalEnd},${metrics.cardCenterY} ${horizontalEnd - 8},${metrics.cardCenterY - 5} ${horizontalEnd - 8},${metrics.cardCenterY + 5}`}
+          className="panorama-connector-arrow"
+        />
+      </svg>
+
+      <div ref={cardWrapperRef} className="relative z-10 pl-16">
+        <NodeCard
+          id={nodeId}
+          title={node.resolvedFile || node.file || '未知文件'}
+          subtitle={node.name}
+          description={node.description}
+          drillDown={node.drillDown}
+          stopReason={node.stopReason}
+          selectedNodeId={selectedNodeId}
+          activeNodeId={activeNodeId}
+          moduleColor={moduleColor}
+          isDimmed={isDimmed}
+          onClick={() =>
+            onSelectNode(nodeId, {
+              filePath: node.resolvedFile || node.file,
+              snippet: node.resolvedSnippet,
+            })
+          }
+        />
+      </div>
+
+      {node.children && node.children.length > 0 && (
+        <div className="ml-16 mt-6">
+          <FunctionTree
+            nodes={node.children}
+            path={nextPath}
+            selectedNodeId={selectedNodeId}
+            activeNodeId={activeNodeId}
+            nodeModuleMap={nodeModuleMap}
+            moduleColorMap={moduleColorMap}
+            activeModuleId={activeModuleId}
+            parentConnectorOffset={24}
+            onSelectNode={onSelectNode}
+          />
+        </div>
+      )}
+    </div>
+  );
+};
+
 const FunctionTree = ({
   nodes,
   path,
   selectedNodeId,
   activeNodeId,
+  nodeModuleMap,
+  moduleColorMap,
+  activeModuleId,
+  parentConnectorOffset,
   onSelectNode,
 }: {
   nodes: SubFunctionAnalysis[];
   path: number[];
   selectedNodeId: string;
   activeNodeId: string | null;
+  nodeModuleMap?: Record<string, string>;
+  moduleColorMap?: Record<string, string>;
+  activeModuleId?: string | null;
+  parentConnectorOffset: number;
   onSelectNode: PanoramaTreeProps['onSelectNode'];
 }) => {
   if (nodes.length === 0) {
@@ -104,49 +295,23 @@ const FunctionTree = ({
   }
 
   return (
-    <div className="relative mt-8 ml-12 flex flex-col gap-6">
-      {nodes.map((node, index) => {
-        const nextPath = [...path, index];
-        const nodeId = `node-${nextPath.join('-')}`;
-
-        return (
-          <div key={`${node.resolvedFile || node.file}-${node.name}-${nodeId}`} className="relative z-10 pl-12">
-            <div
-              className={`animated-dash-vertical panorama-link-vertical absolute left-0 z-0 ${
-                index === 0 ? 'top-[-32px]' : 'top-[-24px]'
-              } ${index === nodes.length - 1 ? 'bottom-1/2' : 'bottom-[-24px]'}`}
-            />
-            <div className="animated-dash-horizontal panorama-link-horizontal absolute top-1/2 left-0 z-0 w-12 -translate-y-1/2" />
-
-            <NodeCard
-              id={nodeId}
-              title={node.resolvedFile || node.file || '未知文件'}
-              subtitle={node.name}
-              description={node.description}
-              drillDown={node.drillDown}
-              stopReason={node.stopReason}
-              selectedNodeId={selectedNodeId}
-              activeNodeId={activeNodeId}
-              onClick={() =>
-                onSelectNode(nodeId, {
-                  filePath: node.resolvedFile || node.file,
-                  snippet: node.resolvedSnippet,
-                })
-              }
-            />
-
-            {node.children && node.children.length > 0 && (
-              <FunctionTree
-                nodes={node.children}
-                path={nextPath}
-                selectedNodeId={selectedNodeId}
-                activeNodeId={activeNodeId}
-                onSelectNode={onSelectNode}
-              />
-            )}
-          </div>
-        );
-      })}
+    <div className="relative flex flex-col gap-0">
+      {nodes.map((node, index) => (
+        <TreeNodeItem
+          key={`${node.resolvedFile || node.file}-${node.name}-${path.join('-')}-${index}`}
+          node={node}
+          index={index}
+          total={nodes.length}
+          path={path}
+          selectedNodeId={selectedNodeId}
+          activeNodeId={activeNodeId}
+          nodeModuleMap={nodeModuleMap}
+          moduleColorMap={moduleColorMap}
+          activeModuleId={activeModuleId}
+          parentConnectorOffset={parentConnectorOffset}
+          onSelectNode={onSelectNode}
+        />
+      ))}
     </div>
   );
 };
@@ -156,6 +321,9 @@ export default function PanoramaTree({
   entryFilePath,
   selectedNodeId,
   activeNodeId,
+  nodeModuleMap,
+  moduleColorMap,
+  activeModuleId,
   onSelectNode,
 }: PanoramaTreeProps) {
   if (!analysis) {
@@ -165,6 +333,10 @@ export default function PanoramaTree({
       </div>
     );
   }
+
+  const rootModuleId = nodeModuleMap?.root;
+  const rootModuleColor = rootModuleId ? moduleColorMap?.[rootModuleId] : undefined;
+  const rootDimmed = Boolean(activeModuleId && rootModuleId !== activeModuleId);
 
   return (
     <div className="relative flex h-full flex-1 flex-col overflow-hidden bg-zinc-950/50">
@@ -202,6 +374,8 @@ export default function PanoramaTree({
                     stopReason={analysis.stopReason}
                     selectedNodeId={selectedNodeId}
                     activeNodeId={activeNodeId}
+                    moduleColor={rootModuleColor}
+                    isDimmed={rootDimmed}
                     onClick={() =>
                       onSelectNode('root', {
                         filePath: entryFilePath,
@@ -210,13 +384,19 @@ export default function PanoramaTree({
                   />
                 </div>
 
-                <FunctionTree
-                  nodes={analysis.subFunctions}
-                  path={[]}
-                  selectedNodeId={selectedNodeId}
-                  activeNodeId={activeNodeId}
-                  onSelectNode={onSelectNode}
-                />
+                <div className="mt-8 ml-16">
+                  <FunctionTree
+                    nodes={analysis.subFunctions}
+                    path={[]}
+                    selectedNodeId={selectedNodeId}
+                    activeNodeId={activeNodeId}
+                    nodeModuleMap={nodeModuleMap}
+                    moduleColorMap={moduleColorMap}
+                    activeModuleId={activeModuleId}
+                    parentConnectorOffset={32}
+                    onSelectNode={onSelectNode}
+                  />
+                </div>
               </div>
             </TransformComponent>
           </>
